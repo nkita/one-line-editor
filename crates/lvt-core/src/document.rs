@@ -10,6 +10,7 @@ use crate::buffer::TextBuffer;
 use crate::encoding::{self, DecodedText, LineEnding, SaveError, TextEncoding};
 use crate::history::{Edit, History, MergeKind};
 use crate::selection::Selection;
+use crate::vim::Visual;
 use crate::syntax::{self, HighlightCache, Highlighter, LineState, StyleSpan};
 
 pub struct Document {
@@ -17,6 +18,8 @@ pub struct Document {
     selection: Selection,
     /// 上下移動時に維持する表示桁。
     pub preferred_col: Option<usize>,
+    /// Vim のビジュアルモードの状態 (選択範囲は `vim` モジュールがこれから作る)。
+    pub visual: Option<Visual>,
     history: History,
     path: Option<PathBuf>,
     pub encoding: TextEncoding,
@@ -41,6 +44,7 @@ impl Document {
             buffer: TextBuffer::new(),
             selection: Selection::default(),
             preferred_col: None,
+            visual: None,
             history: History::new(),
             path: None,
             encoding: TextEncoding::Utf8,
@@ -99,6 +103,11 @@ impl Document {
 
     pub fn selection(&self) -> Selection {
         self.selection
+    }
+
+    /// キャレットを描く位置。通常は選択の head、Vim のビジュアルモードではカーソル位置。
+    pub fn caret_pos(&self) -> usize {
+        self.visual.map_or(self.selection.head, |v| v.cursor.min(self.buffer.len_chars()))
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -203,6 +212,15 @@ impl Document {
         self.preferred_col = None;
     }
 
+    /// これ以降 `end_undo_group` までの変更を 1 回の Undo で戻せるようにする。
+    pub fn begin_undo_group(&mut self) {
+        self.history.begin_group();
+    }
+
+    pub fn end_undo_group(&mut self) {
+        self.history.end_group();
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(tx) = self.history.pop_undo() else { return false };
         for e in tx.edits.iter().rev() {
@@ -274,6 +292,26 @@ mod tests {
         }
         d.undo();
         assert_eq!(d.buffer().to_string(), "");
+    }
+
+    #[test]
+    fn undo_group() {
+        let mut d = Document::from_text("abc");
+        d.set_selection(Selection::caret(3));
+        d.begin_undo_group();
+        d.replace_selection("\n", MergeKind::None);
+        d.replace_selection("x", MergeKind::Typing);
+        d.set_selection(Selection::caret(0));
+        d.replace_selection("y", MergeKind::None);
+        d.end_undo_group();
+        d.replace_selection("z", MergeKind::None);
+        assert_eq!(d.buffer().to_string(), "yzabc\nx");
+        d.undo();
+        assert_eq!(d.buffer().to_string(), "yabc\nx");
+        d.undo();
+        assert_eq!(d.buffer().to_string(), "abc");
+        d.redo();
+        assert_eq!(d.buffer().to_string(), "yabc\nx");
     }
 
     #[test]

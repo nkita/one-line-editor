@@ -8,6 +8,7 @@
 //! 発行するだけでよい。足りない操作はここに追加する。
 
 use crate::encoding::{LineEnding, TextEncoding};
+use crate::vim::VimEdit;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -50,6 +51,8 @@ pub enum EditCommand {
     DuplicateLine,
     Undo,
     Redo,
+    /// Vim キーバインドの編集操作。
+    Vim(VimEdit),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +64,8 @@ pub enum AppCommand {
     CloseTab,
     NextTab,
     PrevTab,
+    /// アクティブなタブを左 (負) / 右 (正) へ移動する。
+    MoveTab(i32),
     Exit,
     Cut,
     Copy,
@@ -81,6 +86,16 @@ pub enum AppCommand {
     ScrollLines(i32),
     /// プロンプトバー (検索欄など) を閉じる。
     Cancel,
+    /// Vim キーバインドの有効・無効を切り替える。
+    ToggleVim,
+    /// Vim の p / P: クリップボードの内容を貼り付ける (行単位かどうかは UI 層が判断する)。
+    VimPaste { before: bool, count: usize },
+    /// Vim の `:` コマンドライン。`visual` ならビジュアルモードの行範囲を `'<,'>` として使う。
+    VimCommandLine { visual: bool },
+    /// Vim の `/` (forward) と `?`。
+    VimSearch { forward: bool },
+    /// Vim の `*` / `#`: キャレット位置の単語を検索する。
+    SearchWord { forward: bool },
 }
 
 impl From<EditCommand> for Command {

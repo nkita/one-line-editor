@@ -183,6 +183,8 @@ impl Keymap {
         m.bind("Ctrl+PageDown", A::NextTab);
         m.bind("Ctrl+Shift+Tab", A::PrevTab);
         m.bind("Ctrl+PageUp", A::PrevTab);
+        m.bind("Ctrl+Shift+PageUp", A::MoveTab(-1));
+        m.bind("Ctrl+Shift+PageDown", A::MoveTab(1));
         m.bind("Ctrl+X", A::Cut);
         m.bind("Shift+Delete", A::Cut);
         m.bind("Ctrl+C", A::Copy);
@@ -200,6 +202,7 @@ impl Keymap {
         m.bind("Ctrl+-", A::ZoomOut);
         m.bind("Ctrl+0", A::ZoomReset);
         m.bind("Escape", A::Cancel);
+        m.bind("Ctrl+Alt+V", A::ToggleVim);
         m
     }
 }
@@ -226,8 +229,8 @@ pub enum ModeResponse {
 /// 入力モード。キー入力を解釈してコマンド列を返す。
 pub trait InputMode {
     /// ステータスバーに表示する名前 (空ならば表示しない)。
-    fn name(&self) -> &str {
-        ""
+    fn name(&self) -> String {
+        String::new()
     }
 
     fn caret_style(&self) -> CaretStyle {
@@ -239,6 +242,20 @@ pub trait InputMode {
 
     /// 文字が入力された (IME の確定文字列も含む)。
     fn on_text(&mut self, text: &str) -> ModeResponse;
+
+    /// Vim のノーマルモードのように、キャレットを文字の上に置き、選択を持たない状態か。
+    /// 真なら UI 層は入力のあとに `vim::normalize_caret` でキャレットを整える。
+    fn normal_caret(&self) -> bool {
+        false
+    }
+
+    /// マウスでのクリック・ドラッグが終わった (`has_selection`: 選択範囲があるか)。
+    fn on_mouse(&mut self, _has_selection: bool) -> ModeResponse {
+        ModeResponse::Unhandled
+    }
+
+    /// タブの切り替えなどで、入力途中の状態を破棄する。
+    fn reset(&mut self) {}
 
     /// メニュー表示用のショートカット。
     fn shortcut_for(&self, _cmd: &Command) -> Option<KeyChord> {

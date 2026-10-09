@@ -1,112 +1,179 @@
 # lvt 設計書
 
-EmEditor のように **高速・省メモリ・シンプル** な Windows 専用テキストエディタ。
+lvt は、EmEditor のように **高速・省メモリ・シンプル** なことを目指す Windows 専用テキストエディタです。
+この文書群は、新しく参加した開発者がコードを読み、機能を追加できるようにすることを目的としています。
 
-## 1. 目標と前提
+## 文書の構成
 
-| 項目 | 目標 |
+| 文書 | 内容 | 読むべき人 |
+|---|---|---|
+| **DESIGN.md** (本書) | 要件、全体構成、設計原則、主要な設計判断、制限、ロードマップ | 全員 |
+| [design/core.md](design/core.md) | `lvt-core` の各モジュールの仕様 (型・不変条件・アルゴリズム) | コア部を触る人 |
+| [design/frontend.md](design/frontend.md) | `lvt-app` (Win32 フロントエンド) の仕様 (メッセージ処理・描画・再入対策) | UI を触る人 |
+| [design/extending.md](design/extending.md) | 機能追加の手順書 (コマンド、キー、言語、Vim モード、Markdown デザイン、設定ファイルなど) | 機能を追加する人 |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | 開発環境、コーディング規約、テスト、完了の定義 | 全員 |
+| [BUILD_AND_VERIFY.md](BUILD_AND_VERIFY.md) | ビルド手順と Windows での検証チェックリスト | 全員 |
+
+---
+
+## 1. 要件
+
+### 1.1 機能要件 (v0.1 で実装済み)
+
+| 分類 | 機能 |
 |---|---|
-| 対象ファイル | 数百MB まで (GB 級は将来対応。§6 参照) |
-| 起動 | 100ms 程度、単一 exe (ランタイム DLL 不要) |
-| メモリ | 空の状態で十数MB、ファイルを開いた後はファイルサイズの約 1.1〜1.2 倍 |
-| 対象 OS | Windows 10/11 x64 |
+| 編集 | 文字入力 (IME 対応)、自動インデント、Tab/Shift+Tab (複数行)、削除 (文字・単語)、行の複製、Undo/Redo (連続入力は 1 単位にまとめる) |
+| 移動・選択 | 文字・単語 (日本語の文字種で区切る)・行頭 (スマートホーム)・行末・ページ・文書端。Shift で選択。マウスでのクリック、ドラッグ、ダブルクリック (単語)、行番号のクリック (行選択) |
+| ファイル | 開く (複数選択、D&D、コマンドライン引数)、保存、名前を付けて保存、未保存時の確認 |
+| 文字コード | 自動判定 (BOM → UTF-8 検証 → chardetng)。UTF-8 / UTF-8 BOM / UTF-16 LE/BE / Shift_JIS / EUC-JP。指定した文字コードで開き直す。保存時の文字コード・改行コード (CRLF/LF/CR) の変更 |
+| タブ | 新規・切り替え・閉じる、未保存マーク、同じファイルは同じタブへ、ドラッグ (と Ctrl+Shift+PgUp/PgDn) での並べ替え |
+| 検索 | インクリメンタル検索、次/前 (折り返しあり)、大文字小文字の区別、正規表現、全置換 (`$1` 参照)、行番号へ移動 |
+| 表示 | 行番号、現在行の強調、検索一致の強調、Markdown のハイライト、URL の自動リンク (Ctrl+クリックでブラウザを開く)、ライト/ダークテーマ、文字サイズ変更、高 DPI 対応 |
+| Vim | Normal / Insert / Visual / Visual Line、モーション・演算子・テキストオブジェクト・回数、`.`、`:` コマンド (`:w` `:q` `:s` など)、`/` `?` `n` `N` `*` `#`。**既定でオン**。ヤンクは OS のクリップボードと共有。`:` `/` `?` はステータスバーの行・桁の位置で入力する。オン/オフは次回起動時も保持 (`%APPDATA%\lvt\settings.toml`) |
 
-**実測値 (WSL 上、lvt-core 単体)**: 411MB / 300万行の UTF-8 ファイルの読み込みは 1.06 秒で、ピークメモリは 473MB でした。全文検索 (一致なし) は 0.19 秒です。
+### 1.2 非機能要件
 
-## 2. 技術選定
-
-| 領域 | 採用 | 理由 |
+| 項目 | 目標 | 実測 (v0.1) |
 |---|---|---|
-| 言語 | Rust | 速度・安全性・保守性 |
-| UI | Win32 API を直接使用 (`windows` crate 0.62) | GUI フレームワークを使わないので軽量で、IME とも素直に連携できる |
-| 描画 | Direct2D + DirectWrite | ClearType、フォントフォールバック、カラー絵文字、高 DPI に対応 |
-| テキストバッファ | `ropey` (B木 rope) | 挿入・削除・行⇔位置の変換が O(log n) |
-| 文字コード | `encoding_rs` + `chardetng` | 高速な変換と自動判定 |
-| 検索 | `regex` | 線形時間が保証される |
+| 対象ファイルサイズ | 数百MB | 411MB / 300万行を確認済み |
+| 読み込み時間 | 数百MB で数秒以内 | 411MB を 1.06 秒 (WSL 上、コア部のみ) |
+| メモリ | ファイルサイズの 1.2 倍以内 | ピーク時 1.15 倍 |
+| 検索 | 数百MB の全文検索が 1 秒以内 | 411MB で 0.19 秒 (一致なし) |
+| 配布 | 単一 exe、ランタイム不要 | 2.2MB。依存するのは Windows 標準の DLL のみ |
+| 対象 OS | Windows 10/11 x64 | |
 
-非同期ランタイムや GUI フレームワークのような重い依存は持ちません。
+### 1.3 当面のスコープ外
 
-## 3. 構成
+マクロ、CSV/TSV モード、GB 級ファイル、プラグイン機構。
 
-```
-crates/
-├─ lvt-core/   OS 非依存の中核 (Linux 上で cargo test できる)
-│  ├─ buffer.rs     TextBuffer (rope のラッパー。内部の改行は LF)
-│  ├─ selection.rs  Selection {anchor, head}
-│  ├─ history.rs    Undo/Redo (トランザクション、連続入力の結合、保存位置の追跡)
-│  ├─ document.rs   Document = バッファ + 選択 + 履歴 + ファイル情報 + ハイライト状態
-│  ├─ editor.rs     EditCommand の実行 (移動・入力・削除・インデントなど)
-│  ├─ command.rs    Command = Edit(EditCommand) | App(AppCommand)
-│  ├─ keymap.rs     KeyChord / Keymap / InputMode トレイト / StandardMode
-│  ├─ search.rs     ブロック単位の正規表現検索・全置換
-│  ├─ encoding.rs   文字コード判定、ストリーミング読み込み、安全な保存
-│  ├─ syntax/       Highlighter トレイト、行状態キャッシュ、Markdown ハイライタ
-│  ├─ theme.rs      配色 (TokenKind → TextStyle)
-│  └─ width.rs      表示桁 (全角=2)、単語境界の文字種
-└─ lvt-app/    Windows フロントエンド (bin: lvt.exe)
-   └─ src/win/
-      ├─ mod.rs      ウィンドウ生成、wndproc、モーダルを伴う処理 (開く/保存/閉じる)
-      ├─ app.rs      App 状態: タブ・入力・マウス・スクロール・検索・IME
-      ├─ paint.rs    描画 (表示行のみレイアウト)
-      ├─ render.rs   Direct2D/DirectWrite 資源と描画プリミティブ
-      ├─ menu.rs     メニュー (Command に対応付け)
-      ├─ prompt.rs   下部の入力欄 (検索・置換・行移動)
-      ├─ dialogs.rs  ファイルダイアログ、メッセージボックス、クリップボード
-      └─ input.rs    仮想キー → Key 変換
-```
+### 1.4 将来の拡張として想定するもの (設計上の余地を確保済み)
 
-### データの流れ
+Markdown 用の表示デザイン (見出しの拡大など)、設定ファイル、言語ごとのハイライト、コマンドパレット、Vim の未対応機能 (名前付きレジスタ・マクロ・マーク・矩形選択など)。
+→ [design/extending.md](design/extending.md)
+
+---
+
+## 2. 全体構成
+
+### 2.1 クレート構成
 
 ```
-WM_KEYDOWN / WM_CHAR (IME確定文字列を含む)
-      │  input.rs: 仮想キー → KeyChord
-      ▼
-InputMode::on_key / on_text  ──→  Vec<Command>
-      │                              │
-      │  Command::Edit ──→ editor::execute(&mut Document)   (OS 非依存)
-      │  Command::App  ──→ App::execute_app                 (ファイル/タブ/検索/表示)
-      │                      └ モーダルが必要なら Deferred を返す → mod.rs が借用外で実行
-      ▼
-App::refresh → InvalidateRect → WM_PAINT → paint.rs
-   (Document + Highlighter + Theme → 表示行だけ DirectWrite でレイアウトして描画)
+lvt-editor-c/
+├─ Cargo.toml              ワークスペース (release: LTO, panic=abort, strip)
+├─ .cargo/config.toml      Windows 向けクロスビルドの設定とエイリアス
+├─ crates/
+│  ├─ lvt-core/            ★ OS 非依存の中核 (Linux 上で cargo test できる)
+│  │  ├─ src/              buffer / selection / history / document / editor / command /
+│  │  │                    keymap / search / encoding / syntax / theme / width /
+│  │  │                    link / settings / vim/ (mod, parse, exec, motion, ex)
+│  │  └─ examples/load_bench.rs   読み込み・検索の速度計測
+│  └─ lvt-app/             ★ Windows フロントエンド (bin: lvt.exe)
+│     └─ src/win/          mod / app / paint / render / menu / prompt / dialogs / input / util
+├─ docs/                   本書ほか
+└─ scripts/                deploy.sh (Windows へ配置)、gen_testdata.py (テストデータ生成)
 ```
 
-### 設計上の要点
+**依存の向きは一方向です**: `lvt-app` → `lvt-core`。`lvt-core` は Windows API に一切依存してはいけません。
 
-- **変更経路の一本化**: テキストの変更は必ず `Document::apply` / `replace_selection` / `undo` / `redo` を通ります。これにより、履歴・ハイライトキャッシュ・リビジョン番号が常に整合します。
-- **再入対策**: `App` は `thread_local! RefCell` に置き、メッセージ処理ごとに借用します。モーダルダイアログ (ファイル選択・確認) は内部でメッセージループを回すため、`Deferred` として借用を解いてから実行します。
-- **描画は見える範囲だけ**: 1 行ずつ `IDWriteTextLayout` を作り、行番号・選択範囲・検索一致・キャレットを描きます。1 行が極端に長い場合は、先頭 20,000 文字までを描画対象にします。
-- **読み込みはストリーミング**: 先頭 1MB で文字コードを判定し、1MB ずつデコードと改行の正規化をしながら rope を構築します。ファイル全体の一時コピーを作らないので、ピークメモリは最終的な rope のサイズとほぼ同じです。
-- **保存は安全に**: 一時ファイルに書き出してから rename します。指定の文字コードで表せない文字があれば、保存せずに確認します (UTF-8 に切り替えて保存することもできます)。
+### 2.2 レイヤーと責務
 
-## 4. 拡張ポイント
+```
+┌───────────────────────────────────────────────────────────────┐
+│ lvt-app (Windows 専用)                                          │
+│  wndproc ─ メッセージ解釈 ─ App (タブ/検索/表示状態) ─ paint/render   │
+│  dialogs (モーダル・クリップボード)  menu  prompt  input             │
+├───────────────────────────────────────────────────────────────┤
+│ lvt-core (OS 非依存)                                             │
+│  入力解釈: keymap (InputMode, Keymap)、vim (VimMode)                │
+│  操作:     command (Command)  →  editor::execute                   │
+│  文書:     document (Document) = buffer + selection + history      │
+│            + ファイル情報 + ハイライト状態                            │
+│  補助:     search / encoding / syntax / theme / width              │
+│  外部クレート: ropey, encoding_rs, chardetng, regex, unicode-width   │
+└───────────────────────────────────────────────────────────────┘
+```
 
-| 将来機能 | 拡張点 | 実装の方針 |
+### 2.3 処理の流れ
+
+```
+[キー入力]
+ WM_KEYDOWN ─ input::key_from_vk ─→ KeyChord ─┐
+ WM_CHAR (IME の確定文字列を含む) ──→ 文字列 ────┤
+                                              ▼
+                       InputMode::on_key / on_text   (既定: StandardMode)
+                                              │ Vec<Command>
+[メニュー] WM_COMMAND ─ Menus::command(id) ───────┤
+                                              ▼
+                                       App::execute
+                ┌─────────────────────────────┴───────────────────────┐
+     Command::Edit(EditCommand)                          Command::App(AppCommand)
+     editor::execute(&mut Document, ...)                 App::execute_app
+     (OS 非依存・単体テスト可能)                            ├ その場で完了 (タブ切替・検索・ズーム等)
+                                                         └ モーダルが必要 → Deferred を返す
+                                                              → mod.rs が App の借用を解いて実行
+                                              ▼
+                       App::refresh → InvalidateRect → WM_PAINT
+                                              ▼
+       paint.rs: 表示行だけ DirectWrite でレイアウトし、ハイライト・選択・キャレットを描く
+```
+
+---
+
+## 3. 設計原則
+
+1. **OS 非依存のロジックはすべて `lvt-core` に置く。** 編集・検索・文字コードなどは Linux 上の単体テストで検証できるようにします。`lvt-app` は「Windows のイベントをコマンドに変換する」「状態を描く」ことに専念します。
+2. **すべての操作は `Command` を経由する。** キー、メニュー、将来のコマンドパレットやマクロも、同じ `Command` を発行します。操作を追加するときは、まず `Command` に追加します。
+3. **テキストの変更経路は 1 本にする。** 変更は必ず `Document::apply` / `replace_selection` / `undo` / `redo` を通します。これで履歴・ハイライトキャッシュ・リビジョン番号が常に整合します。`TextBuffer` を直接書き換えることは禁止です。
+4. **見えている範囲だけ処理する。** 描画は表示行だけを対象にします。ハイライトの状態は一定行ごとのチェックポイントにキャッシュします。全行を走査するのは検索・置換・読み込み・保存だけです。
+5. **全体のコピーを作らない。** 読み込みは 1MB 単位のストリーミング処理で、検索も約 1MB 単位のブロックで行います。ファイル全体を String にすることはしません。
+6. **拡張点はトレイトで切る。** 入力モード (`InputMode`)、ハイライタ (`Highlighter`)、テキストバッファの実装 (`TextBuffer` の内部) は差し替えられるようにします。
+7. **依存は最小限にする。** GUI フレームワークや非同期ランタイムは使いません。クレートを追加する場合は、サイズ・ビルド時間・保守状況を確認したうえでレビューで合意します。
+
+---
+
+## 4. 主要な設計判断
+
+| # | 判断 | 理由 | 却下した案 |
+|---|---|---|---|
+| D1 | 言語は Rust | 速度・メモリ安全性・保守性 | C++ (保守コスト)、C#/WPF (起動とメモリ) |
+| D2 | Win32 API を直接使い、描画は Direct2D/DirectWrite で自前で行う | 軽量で起動が速い。IME と素直に連携でき、高 DPI・カラー絵文字・フォントフォールバックを OS に任せられる | egui/iced (IME と見た目)、WinUI/WPF (重い)、GDI (高 DPI と絵文字) |
+| D3 | テキストバッファは ropey (全量をメモリに置く) | 要件が数百MB までなので十分。行 ⇔ 位置の変換が O(log n) | mmap + ピースツリー (GB 級向け。複雑なので将来の差し替え候補) |
+| D4 | 内部表現は UTF-8 + LF に統一する | 扱いが単純になる。保存時に元の形式へ戻す | 元の文字コードのまま保持 (操作が複雑になる) |
+| D5 | 位置は「文字 (Unicode スカラー値) インデックス」で表す | ropey の API と一致し、サロゲートペアを意識せずに済む | バイト位置 / UTF-16 位置 (変換は UI 層の境界で行う) |
+| D6 | クロスビルドのターゲットは `x86_64-pc-windows-gnu` (mingw-w64) | WSL だけで完結する。`+crt-static` で単一 exe になる | MSVC + cargo-xwin (SDK の取得が必要) |
+| D7 | App は `thread_local! RefCell` に置き、モーダルは `Deferred` で借用外で実行する | モーダルダイアログ中の再入で二重借用 (未定義動作・panic) が起きない | GWLP_USERDATA のポインタ (再入時に &mut が重複する) |
+| D8 | IME は IMM32 を使う | 実装量が少なく、日本語入力の基本動作には十分 | TSF (高機能だが大規模。将来検討) |
+| D9 | 検索は行境界で切った約 1MB のブロックごとに regex を適用する | 全体を String にしないのでメモリが一定 | 全体を文字列化 (メモリ 2 倍) |
+| D10 | ハイライトは `TokenKind` (意味) を返し、色は `Theme` が決める | テーマとハイライタを独立させる | ハイライタが色を直接返す |
+
+---
+
+## 5. 既知の制限 (v0.1)
+
+| 制限 | 影響 | 解消の方針 |
 |---|---|---|
-| **Vim キーバインド** | `keymap::InputMode` トレイト | `VimMode { state: Normal/Insert/Visual, pending: Vec<KeyChord> }` を実装し、`on_key`/`on_text` が `Command` を返す。`name()` でモード名をステータスバーに表示し、`caret_style()` でブロックキャレットにする。`d2w` のような演算子とモーションの組み合わせは、`EditCommand` に `DeleteRange(Motion)` などを足して表現する。`:` コマンドラインには `prompt.rs` を流用し、`PromptKind::Command` を追加する。切り替えは `win/mod.rs` の `mode` 生成箇所 (将来は設定ファイル) で行う |
-| **Markdown 用デザイン** | `syntax::Highlighter` + `theme::Theme` | 現在は色・太字・斜体・下線まで。見出しの文字を大きくしたりコードブロックに背景を付けたりするには、次の 2 段階で拡張する: ① `Highlighter` に `fn line_decoration(&self, line, state) -> LineDecoration { scale, background, left_border }` を追加 (既定実装は「装飾なし」)。② 描画とスクロールを「行番号 × 固定の行の高さ」から、各行の高さを累積したマップ (`LineHeights`: 行の高さが均一なら現在の計算、可変なら区間木) へ抽象化する。①を先に入れれば、②の前でも背景色や罫線は実現できる |
-| 言語ごとのハイライト | `syntax::highlighter_for_path` | 言語ごとに `Highlighter` を実装して登録する。行をまたぐ状態は `LineState(u32)` で表す |
-| キー設定・設定ファイル | `KeyChord::parse`, `Keymap::bind` | TOML (`%APPDATA%\lvt\config.toml` または exe と同じフォルダ) からキー割り当て、フォント、テーマ、タブ幅を読む。コマンドを名前で指定できるよう `Command::from_name` を追加する |
-| コマンドパレット | すべての操作が `Command` を経由する | コマンド名の一覧からあいまい検索して実行する |
-| テーマ | `Theme` | TOML から読み込む |
-| GB 級ファイル | `TextBuffer` の内部 | mmap + ピースツリー + 疎な行インデックスに差し替える。公開 API (文字インデックス・行 API) は維持する |
-| マルチカーソル | `Selection` | `Document` を `Vec<Selection>` を持つ形に拡張する |
+| 折り返し表示がない | 長い行は横スクロールが必要 | ロードマップ R2 |
+| 1 行の描画は先頭 20,000 文字まで (`MAX_RENDER_CHARS`) | それ以降は表示・クリックができない | 表示範囲だけをレイアウトする方式にする |
+| 改行コードが混在するファイルは、保存時に最も多い改行コードへ統一される | 意図しない差分が出る | 必要なら行ごとに改行コードを保持する |
+| 読み込みは同期処理 | 数百MB で 1〜数秒、UI が止まる (待機カーソルを表示) | ロードマップ R5 |
+| 検索ブロックをまたぐ複数行マッチは見つからない | 正規表現で改行をまたぐ場合のみ | ブロックを重ねて走査する |
+| マウス位置の計算は書式なしのレイアウトで行う | Markdown の太字の行で、クリック位置がわずかにずれることがある | 行レイアウトのキャッシュを共有する |
+| ビジュアルスタイルのマニフェストがない | メッセージボックスが旧来の見た目になる | `embed-resource` などでマニフェストを埋め込む |
+| 設定ファイルがない | フォント・キー・タブ幅は固定 | ロードマップ R1 |
 
-## 5. v0.1 の既知の制限
+---
 
-- 折り返し表示はない (横スクロールのみ)
-- 1 行の描画対象は先頭 20,000 文字まで (それ以降は表示されない)
-- 改行コードが混在するファイルは、保存時に最も多い改行コードへ統一される
-- 読み込みは同期処理 (数百MB で 1〜数秒。待機カーソルを表示する)
-- IME は IMM32 で、変換ウィンドウの位置はキャレットに合わせる (TSF は将来)
-- 検索は約 1MB のブロック単位で行うため、ブロックをまたぐ複数行マッチは見つからない
-- ビジュアルスタイルのマニフェストを埋め込んでいないため、メッセージボックスが旧来の見た目になる
+## 6. ロードマップ
 
-## 6. 今後のロードマップ案
+番号は推奨する着手順です。各項目の具体的な手順は [design/extending.md](design/extending.md) を参照してください。
 
-1. 設定ファイル (TOML) とキー割り当てのカスタマイズ
-2. 折り返し表示
-3. Vim モード (`InputMode` 実装)
-4. Markdown の行装飾 (`LineDecoration`) と可変の行の高さ
-5. ファイルのバックグラウンド読み込みと進捗表示
-6. GB 級ファイル対応 (mmap + ピースツリー)
+| # | 項目 | 主な変更箇所 | 規模 |
+|---|---|---|---|
+| R1 | 設定ファイル (TOML): フォント、タブ幅、テーマ、キー割り当て。※ 入力モードの記憶だけは `settings.rs` で先行実装済み | 新規 `lvt-core/src/config.rs`、`Command::from_name`、`win/mod.rs` | 中 |
+| R2 | 折り返し表示 | `paint.rs`、`app.rs` (スクロールを「表示行」単位に)、`editor.rs` (上下移動) | 大 |
+| R3 | ~~Vim モード~~ (実装済み。第 2 段階: 名前付きレジスタ、マクロ、マーク、矩形選択、`R`、ジャンプリスト) | `lvt-core/src/vim/` | 中 |
+| R4 | Markdown の行装飾と可変の行の高さ | `syntax` (`LineDecoration`)、`paint.rs`、`app.rs` (行の高さのマップ) | 大 |
+| R5 | バックグラウンド読み込みと進捗表示 | `win/mod.rs` (ワーカースレッド + `PostMessage`)、`encoding.rs` | 中 |
+| R6 | 行レイアウトのキャッシュ (描画とヒットテストで共有) | `paint.rs`、`app.rs` | 小 |
+| R7 | GB 級ファイル対応 (mmap + ピースツリー) | `buffer.rs` の内部実装 | 大 |
+| R8 | TSF による IME | `win/` に TSF 用モジュールを新設 | 大 |

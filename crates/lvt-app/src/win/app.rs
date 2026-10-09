@@ -10,22 +10,28 @@ use std::time::Instant;
 use lvt_core::editor::{self, EditorConfig, ViewInfo};
 use lvt_core::encoding::{SaveError, TextEncoding};
 use lvt_core::history::MergeKind;
-use lvt_core::keymap::{InputMode, Key, KeyChord, ModeResponse};
+use lvt_core::keymap::{InputMode, Key, KeyChord, Keymap, ModeResponse, StandardMode};
+use lvt_core::link;
+use lvt_core::settings::Settings;
+use lvt_core::vim::{self, ex, Register, VimEdit, VimMode};
 use lvt_core::search::{self, SearchQuery};
 use lvt_core::theme::Theme;
 use lvt_core::{AppCommand, Command, Document, EditCommand, Selection};
 use regex::Regex;
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::{InvalidateRect, LOGFONTW};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient, LOGFONTW, SHIFTJIS_CHARSET};
 use windows::Win32::UI::Input::Ime::{
-    ImmGetContext, ImmReleaseContext, ImmSetCompositionFontW, ImmSetCompositionWindow, CFS_POINT, COMPOSITIONFORM,
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionFontW,
+    ImmSetOpenStatus,
+    ImmSetCompositionWindow, ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED, CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT,
+    COMPOSITIONFORM, GCS_COMPATTR, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING,
 };
 use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetScrollInfo, KillTimer, LoadCursorW, SetCursor, SetTimer, SetWindowTextW, IDC_ARROW,
-    IDC_IBEAM, IDC_WAIT, SB_HORZ, SB_VERT, SCROLLBAR_CONSTANTS, SCROLLINFO, SIF_ALL, SIF_DISABLENOSCROLL, SIF_TRACKPOS,
+    DestroyMenu, GetClientRect, GetCursorPos, GetScrollInfo, SetMenu, WindowFromPoint, KillTimer, LoadCursorW, SetCursor, SetTimer, SetWindowTextW, IDC_ARROW,
+    IDC_HAND, IDC_IBEAM, IDC_WAIT, SB_HORZ, SB_VERT, SCROLLBAR_CONSTANTS, SCROLLINFO, SIF_ALL, SIF_DISABLENOSCROLL, SIF_TRACKPOS,
 };
 
 use super::input;
@@ -63,6 +69,18 @@ pub enum Deferred {
     CloseTab(usize),
     Exit,
     Reopen(TextEncoding),
+    OpenUrl(String),
+    /// Vim の :q / :q! / :wq。最後のタブなら終了する。
+    Quit { idx: usize, save: bool, force: bool },
+}
+
+/// IME で変換中の文字列。本文のキャレット位置に埋め込んで描画する。
+pub struct ImeComposition {
+    pub text: String,
+    /// 変換中の文字列内のカーソル位置 (UTF-16)。
+    pub cursor: usize,
+    /// 変換対象の文節 (UTF-16 の範囲)。
+    pub target: Option<std::ops::Range<usize>>,
 }
 
 pub enum KeyOutcome {
@@ -84,6 +102,7 @@ pub struct Geometry {
     pub text_left: f32,
 }
 
+#[derive(Clone, Copy)]
 pub struct TabHit {
     pub left: f32,
     pub right: f32,
@@ -94,7 +113,12 @@ pub struct TabHit {
 enum Drag {
     Text,
     Lines { anchor_line: usize },
+    /// タブの並べ替え。`moved` はしきい値を超えて動かしたか。
+    Tab { idx: usize, start_x: f32, moved: bool },
 }
+
+/// タブのドラッグを開始とみなす移動量 (DIP)。
+const TAB_DRAG_THRESHOLD: f32 = 4.0;
 
 pub struct App {
     pub hwnd: HWND,
@@ -118,12 +142,49 @@ pub struct App {
     mouse: (f32, f32),
     wheel_accum: i32,
     high_surrogate: Option<u16>,
+    pub ime: Option<ImeComposition>,
     pub suppress_syschar: bool,
     title: String,
+    /// Vim キーバインドが有効か。
+    pub vim_enabled: bool,
+    /// 最後にヤンク・削除した文字列 (クリップボードの内容が行単位かどうかの判断に使う)。
+    register: Option<Register>,
+    /// 直前の入力の時点でノーマルモードだったか (ノーマルモードに戻ったら IME を閉じる)。
+    was_normal: bool,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    /// 入力欄の処理 (`:w` など) から返す `Deferred`。
+    pending_deferred: Option<Deferred>,
+}
+
+/// Vim キーバインドを使うか。設定がなければ Vim を既定にする。
+pub fn vim_by_default(settings: &Settings) -> bool {
+    settings.get("input_mode") != Some("standard")
+}
+
+/// 入力モードを作る。
+pub fn make_mode(vim: bool) -> Box<dyn InputMode> {
+    if vim {
+        Box::new(VimMode::new(Keymap::windows_default()))
+    } else {
+        Box::new(StandardMode::default())
+    }
+}
+
+/// 設定ファイルの場所 (`%APPDATA%\lvt\settings.toml`)。
+pub fn settings_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("lvt").join("settings.toml"))
 }
 
 impl App {
-    pub fn new(hwnd: HWND, mode: Box<dyn InputMode>, menus: Menus) -> Result<Self> {
+    pub fn new(
+        hwnd: HWND,
+        mode: Box<dyn InputMode>,
+        menus: Menus,
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let vim_enabled = vim_by_default(&settings);
         let editor_cfg = EditorConfig::default();
         let renderer = Renderer::new(hwnd, editor_cfg.tab_width)?;
         Ok(Self {
@@ -147,8 +208,15 @@ impl App {
             mouse: (0.0, 0.0),
             wheel_accum: 0,
             high_surrogate: None,
+            ime: None,
             suppress_syschar: false,
             title: String::new(),
+            vim_enabled,
+            register: None,
+            was_normal: false,
+            settings,
+            settings_path,
+            pending_deferred: None,
         })
     }
 
@@ -181,7 +249,8 @@ impl App {
         let height = (rc.bottom - rc.top) as f32 / s;
         let tabbar_h = r.snap(r.ui_line_height + 12.0);
         let status_h = r.snap(r.ui_line_height + 8.0);
-        let prompt_h = if self.prompt.is_some() { r.snap(r.line_height.max(r.ui_line_height) + 12.0) } else { 0.0 };
+        let prompt_bar = self.prompt.as_ref().is_some_and(|p| !p.in_status_bar());
+        let prompt_h = if prompt_bar { r.snap(r.line_height.max(r.ui_line_height) + 12.0) } else { 0.0 };
         let status_top = (height - status_h).max(tabbar_h);
         let prompt_top = (status_top - prompt_h).max(tabbar_h);
         let digits = self.doc().buffer().len_lines().to_string().len().max(3);
@@ -255,14 +324,25 @@ impl App {
 
     fn clamp_scroll(&mut self) {
         let vis = self.visible_lines();
+        let max_x = (self.content_width() - self.text_area_width()).max(0.0);
         let tab = self.tab_mut();
         let max = tab.doc.buffer().len_lines().saturating_sub(vis);
         tab.scroll_line = tab.scroll_line.min(max);
-        tab.scroll_x = tab.scroll_x.clamp(0.0, tab.max_width.max(0.0));
+        tab.scroll_x = tab.scroll_x.clamp(0.0, max_x);
+    }
+
+    /// 本文の表示領域の幅 (DIP)。
+    fn text_area_width(&self) -> f32 {
+        let g = self.geometry();
+        (g.width - g.text_left).max(1.0)
+    }
+
+    /// 横スクロールの対象とする内容の幅 (最長行の右に少し余白を足す)。
+    fn content_width(&self) -> f32 {
+        self.tab().max_width + self.renderer.char_width * 4.0
     }
 
     fn update_scrollbars(&self) {
-        let g = self.geometry();
         let vis = self.visible_lines();
         let tab = self.tab();
         let lines = tab.doc.buffer().len_lines();
@@ -279,9 +359,7 @@ impl App {
             unsafe { SetScrollInfo(self.hwnd, bar, &si, true) };
         };
         set(SB_VERT, (lines.saturating_sub(1)).min(i32::MAX as usize) as i32, vis as u32, tab.scroll_line as i32);
-        let text_w = (g.width - g.text_left).max(1.0);
-        let content_w = tab.max_width + self.renderer.char_width * 4.0;
-        set(SB_HORZ, content_w as i32, text_w as u32, tab.scroll_x as i32);
+        set(SB_HORZ, self.content_width() as i32, self.text_area_width() as u32, tab.scroll_x as i32);
     }
 
     pub fn scroll_by(&mut self, lines: i64) {
@@ -301,7 +379,7 @@ impl App {
         let g = self.geometry();
         let (line, col) = {
             let doc = self.doc();
-            doc.buffer().line_col(doc.selection().head)
+            doc.buffer().line_col(doc.caret_pos())
         };
         let x = self.col_x(line, col);
         let cw = self.renderer.char_width;
@@ -335,9 +413,12 @@ impl App {
         self.status = None;
         let deferred = match cmd {
             Command::Edit(e) => {
-                let view = ViewInfo { page_lines: self.visible_lines().saturating_sub(1).max(1) };
+                let view =
+                    ViewInfo { page_lines: self.visible_lines().saturating_sub(1).max(1), top_line: self.tab().scroll_line };
                 let cfg = self.editor_cfg.clone();
-                editor::execute(self.doc_mut(), &e, &cfg, &view);
+                if let Some(r) = editor::execute(self.doc_mut(), &e, &cfg, &view) {
+                    self.set_register(r);
+                }
                 self.ensure_caret_visible();
                 None
             }
@@ -347,13 +428,78 @@ impl App {
         deferred
     }
 
-    fn execute_commands(&mut self, cmds: Vec<Command>) -> Option<Deferred> {
+    /// 入力 (キー・文字・メニュー) から得たコマンド列を実行する。
+    pub fn execute_commands(&mut self, cmds: Vec<Command>) -> Option<Deferred> {
+        let mut deferred = None;
         for c in cmds {
-            if let Some(d) = self.execute(c) {
-                return Some(d);
+            deferred = self.execute(c);
+            if deferred.is_some() {
+                break;
             }
         }
-        None
+        self.after_input();
+        deferred
+    }
+
+    /// 入力の処理が終わったあとの共通処理。Vim のノーマルモードではキャレットを整え、
+    /// ノーマルモードに戻ったときは IME を閉じる (日本語入力のまま j などを押さないように)。
+    fn after_input(&mut self) {
+        if self.drag.is_some() {
+            return;
+        }
+        let normal = self.mode.normal_caret();
+        if normal {
+            vim::normalize_caret(self.doc_mut());
+            if !self.was_normal {
+                self.close_ime();
+            }
+        }
+        self.was_normal = normal;
+        self.refresh();
+    }
+
+    fn close_ime(&self) {
+        unsafe {
+            let himc = ImmGetContext(self.hwnd);
+            if !himc.is_invalid() {
+                let _ = ImmSetOpenStatus(himc, false);
+                let _ = ImmReleaseContext(self.hwnd, himc);
+            }
+        }
+    }
+
+    /// ヤンク・削除した文字列をクリップボードに置く。
+    fn set_register(&mut self, r: Register) {
+        if !r.text.is_empty() {
+            super::dialogs::set_clipboard(self.hwnd, &r.text);
+            self.register = Some(r);
+        }
+    }
+
+    /// Vim キーバインドの有効・無効を切り替え、設定に保存する。
+    fn set_vim(&mut self, on: bool) {
+        for t in &mut self.tabs {
+            t.doc.end_undo_group();
+            vim::leave_visual(&mut t.doc);
+        }
+        self.mode = make_mode(on);
+        self.vim_enabled = on;
+        self.was_normal = false;
+        // ショートカットの表示が変わるのでメニューを作り直す
+        if let Ok(menus) = Menus::build(self.mode.as_ref()) {
+            let old = std::mem::replace(&mut self.menus, menus);
+            unsafe {
+                let _ = SetMenu(self.hwnd, Some(self.menus.bar));
+                let _ = DestroyMenu(old.bar);
+            }
+        }
+        self.settings.set("input_mode", if on { "vim" } else { "standard" });
+        self.status = Some(if on { "Vim キーバインド: オン" } else { "Vim キーバインド: オフ" }.into());
+        if let Some(path) = &self.settings_path {
+            if let Err(e) = self.settings.save(path) {
+                self.status = Some(format!("設定を保存できませんでした: {e}"));
+            }
+        }
     }
 
     fn execute_app(&mut self, cmd: AppCommand) -> Option<Deferred> {
@@ -370,6 +516,10 @@ impl App {
             A::Exit => return Some(Deferred::Exit),
             A::NextTab => self.activate((self.active + 1) % self.tabs.len()),
             A::PrevTab => self.activate((self.active + self.tabs.len() - 1) % self.tabs.len()),
+            A::MoveTab(delta) => {
+                let to = (self.active as i64 + delta as i64).clamp(0, self.tabs.len() as i64 - 1) as usize;
+                self.move_tab(self.active, to);
+            }
             A::Cut => {
                 if self.copy() {
                     return self.execute(EditCommand::DeleteSelection.into());
@@ -404,6 +554,28 @@ impl App {
                 self.status = Some(format!("改行コード: {}", e.name()));
             }
             A::ScrollLines(n) => self.scroll_by(n as i64),
+            A::ToggleVim => self.set_vim(!self.vim_enabled),
+            A::VimPaste { before, count } => {
+                let text = super::dialogs::get_clipboard(self.hwnd)?;
+                // 自分でヤンクした内容ならその種類、外から来た文字列なら改行で終わるかで判断する
+                let linewise = match &self.register {
+                    Some(r) if r.text == text => r.linewise,
+                    _ => text.ends_with('\n'),
+                };
+                return self.execute(EditCommand::Vim(VimEdit::Paste { text, linewise, before, count }).into());
+            }
+            A::VimCommandLine { visual } => {
+                let range = if visual { vim::visual_line_range(self.doc()) } else { None };
+                vim::leave_visual(self.doc_mut());
+                let initial = if range.is_some() { "'<,'>".to_string() } else { String::new() };
+                let origin = self.doc().caret_pos();
+                self.prompt = Some(Prompt::new(PromptKind::Command { visual: range }, initial, origin));
+            }
+            A::VimSearch { forward } => {
+                let origin = self.doc().caret_pos();
+                self.prompt = Some(Prompt::new(PromptKind::VimSearch { forward }, String::new(), origin));
+            }
+            A::SearchWord { forward } => self.search_word(forward),
             A::Cancel => {
                 if self.prompt.take().is_none() {
                     self.highlight_matches = false;
@@ -415,8 +587,35 @@ impl App {
 
     pub fn activate(&mut self, idx: usize) {
         if idx < self.tabs.len() {
+            if idx != self.active {
+                let doc = self.doc_mut();
+                doc.end_undo_group();
+                vim::leave_visual(doc);
+                self.mode.reset();
+            }
             self.active = idx;
             self.drag = None;
+        }
+    }
+
+    /// タブを `from` から `to` へ移す。アクティブなタブは同じ文書を指し続ける。
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = moved_index(self.active, from, to);
+        // 次の描画までのマウス移動でも正しく判定できるよう、当たり判定も並べ替える
+        if self.tab_hits.len() == self.tabs.len() {
+            let hit = self.tab_hits.remove(from);
+            self.tab_hits.insert(to, hit);
+            let mut x = self.tab_hits[0].left.min(hit.left);
+            for h in &mut self.tab_hits {
+                let (w, close) = (h.right - h.left, h.right - h.close_left);
+                *h = TabHit { left: x, right: x + w, close_left: x + w - close };
+                x += w;
+            }
         }
     }
 
@@ -521,7 +720,7 @@ impl App {
         let doc = self.doc();
         let sel = doc.selection();
         let initial = match kind {
-            PromptKind::GoToLine => String::new(),
+            PromptKind::GoToLine | PromptKind::Command { .. } | PromptKind::VimSearch { .. } => String::new(),
             _ => {
                 let s = doc.selected_text();
                 if !s.is_empty() && !s.contains('\n') && s.len() < 1000 {
@@ -563,14 +762,25 @@ impl App {
         self.status = None;
         self.apply_prompt_query();
         let Some(p) = &self.prompt else { return };
-        if p.kind != PromptKind::Find || self.doc().buffer().len_bytes() > INCREMENTAL_SEARCH_LIMIT {
+        let incremental = matches!(p.kind, PromptKind::Find | PromptKind::VimSearch { .. });
+        if !incremental || self.doc().buffer().len_bytes() > INCREMENTAL_SEARCH_LIMIT {
             return;
         }
         let origin = p.origin;
+        let kind = p.kind.clone();
         match self.search_re.clone() {
             Some(re) => {
                 self.highlight_matches = true;
-                match search::find_next(self.doc().buffer(), &re, origin, true) {
+                let buf = self.doc().buffer();
+                let found = match kind {
+                    // Vim はカーソル位置の一致を飛ばす
+                    PromptKind::VimSearch { forward: true } => {
+                        search::find_next(buf, &re, (origin + 1).min(buf.len_chars()), true)
+                    }
+                    PromptKind::VimSearch { forward: false } => search::find_prev(buf, &re, origin, true),
+                    _ => search::find_next(buf, &re, origin, true),
+                };
+                match found {
                     Some(r) => self.select_match(r),
                     None => self.status = Some("見つかりません".into()),
                 }
@@ -581,7 +791,11 @@ impl App {
 
     fn select_match(&mut self, r: std::ops::Range<usize>) {
         let line = self.doc().buffer().char_to_line(r.start);
-        self.doc_mut().set_selection(Selection::new(r.start, r.end));
+        if self.doc().visual.is_some() {
+            vim::set_visual_cursor(self.doc_mut(), r.start);
+        } else {
+            self.doc_mut().set_selection(Selection::new(r.start, r.end));
+        }
         self.center_line(line);
         self.ensure_caret_visible();
     }
@@ -599,11 +813,18 @@ impl App {
         self.highlight_matches = true;
         let sel = self.doc().selection();
         let buf = self.doc().buffer();
+        // Vim のノーマル・ビジュアルモードでは、キャレット位置の一致を飛ばして次を探す
+        let vim_caret = (self.mode.normal_caret() || self.doc().visual.is_some()).then(|| self.doc().caret_pos());
         let (from, result) = if forward {
-            let from = if sel.is_empty() { sel.head } else { sel.end() };
+            let from = match vim_caret {
+                Some(p) => (p + 1).min(buf.len_chars()),
+                None if sel.is_empty() => sel.head,
+                None => sel.end(),
+            };
             (from, search::find_next(buf, &re, from, true))
         } else {
-            (sel.start(), search::find_prev(buf, &re, sel.start(), true))
+            let before = vim_caret.unwrap_or(sel.start());
+            (before, search::find_prev(buf, &re, before, true))
         };
         match result {
             Some(r) => {
@@ -667,6 +888,110 @@ impl App {
                 self.replace_all(&p.text);
             }
             PromptKind::GoToLine => self.goto(&p.text),
+            PromptKind::VimSearch { forward } => {
+                self.search.pattern = p.text.clone();
+                self.compile_search();
+                if let Some(re) = self.search_re.clone() {
+                    self.highlight_matches = true;
+                    let buf = self.doc().buffer();
+                    let found = if forward {
+                        search::find_next(buf, &re, (p.origin + 1).min(buf.len_chars()), true)
+                    } else {
+                        search::find_prev(buf, &re, p.origin, true)
+                    };
+                    match found {
+                        Some(r) => self.select_match(r),
+                        None => {
+                            self.doc_mut().set_selection(Selection::caret(p.origin));
+                            self.status = Some(format!("見つかりません: {}", self.search.pattern));
+                        }
+                    }
+                }
+            }
+            PromptKind::Command { visual } => self.run_ex(&p.text, visual),
+        }
+    }
+
+    /// Vim の `*` / `#`。
+    fn search_word(&mut self, forward: bool) {
+        let pos = self.doc().caret_pos();
+        let r = editor::word_at(self.doc().buffer(), pos);
+        if r.is_empty() {
+            self.status = Some("カーソル位置に単語がありません".into());
+            return;
+        }
+        let word = self.doc().buffer().slice_to_string(r.clone());
+        self.search.pattern = if self.search.regex { format!(r"\b{}\b", regex::escape(&word)) } else { word };
+        self.search_re = None;
+        self.doc_mut().set_selection(Selection::caret(r.start));
+        self.find(forward);
+    }
+
+    /// `:` コマンドラインの実行。
+    fn run_ex(&mut self, text: &str, visual: Option<(usize, usize)>) {
+        let cmd = match ex::parse(text) {
+            Ok(c) => c,
+            Err(e) => {
+                if !e.is_empty() {
+                    self.status = Some(e);
+                }
+                return;
+            }
+        };
+        let idx = self.active;
+        let buf = self.doc().buffer();
+        let current = buf.char_to_line(self.doc().caret_pos());
+        let n = buf.len_lines();
+        match cmd {
+            ex::ExCommand::Write => self.pending_deferred = Some(Deferred::Save(idx)),
+            ex::ExCommand::Quit { force } => self.pending_deferred = Some(Deferred::Quit { idx, save: false, force }),
+            ex::ExCommand::WriteQuit => self.pending_deferred = Some(Deferred::Quit { idx, save: true, force: false }),
+            ex::ExCommand::NoHighlight => self.highlight_matches = false,
+            ex::ExCommand::GotoLine(spec) => {
+                let line = spec.resolve(current, n);
+                let pos = vim::motion::first_nonblank(buf, line);
+                self.doc_mut().set_selection(Selection::caret(pos));
+                self.center_line(line);
+                self.ensure_caret_visible();
+            }
+            ex::ExCommand::Substitute { range, pattern, replacement, global, ignore_case } => {
+                let lines = match range {
+                    ex::ExRange::Current => current..current + 1,
+                    ex::ExRange::All => 0..n,
+                    ex::ExRange::Lines(a, b) => {
+                        let (a, b) = (a.resolve(current, n), b.resolve(current, n));
+                        a.min(b)..a.max(b) + 1
+                    }
+                    ex::ExRange::Visual => match visual {
+                        Some((a, b)) => a..b + 1,
+                        None => {
+                            self.status = Some("'<,'> の範囲がありません".into());
+                            return;
+                        }
+                    },
+                };
+                let re = match ex::compile(&pattern, ignore_case) {
+                    Ok(re) => re,
+                    Err(e) => {
+                        self.status = Some(e);
+                        return;
+                    }
+                };
+                set_wait_cursor();
+                let edits = ex::substitute(buf, lines, &re, &ex::translate_replacement(&replacement), global);
+                let count = edits.len();
+                if count == 0 {
+                    self.status = Some(format!("見つかりません: {pattern}"));
+                    return;
+                }
+                let first = edits.iter().map(|e| e.0.start).min().unwrap_or(0);
+                self.doc_mut().apply(edits, MergeKind::None, |b, _| {
+                    let line = b.char_to_line(first.min(b.len_chars()));
+                    Selection::caret(vim::motion::first_nonblank(b, line))
+                });
+                self.status = Some(format!("{count} 件置換しました"));
+                self.ensure_caret_visible();
+            }
         }
     }
 
@@ -681,6 +1006,11 @@ impl App {
                 return true;
             }
             (Key::Escape, _, _) => {
+                // Vim の / ? は、取り消したら検索前の位置に戻る
+                if let PromptKind::VimSearch { .. } = p.kind {
+                    let origin = p.origin;
+                    self.doc_mut().set_selection(Selection::caret(origin));
+                }
                 self.prompt = None;
                 return true;
             }
@@ -738,8 +1068,11 @@ impl App {
         let chord = KeyChord::new(key, mods);
         if self.prompt.is_some() && self.prompt_key(chord) {
             self.suppress_syschar = mods.alt;
+            if self.prompt.is_none() {
+                self.after_input();
+            }
             self.refresh();
-            return KeyOutcome::Handled(None);
+            return KeyOutcome::Handled(self.pending_deferred.take());
         }
         // 文字キーは WM_CHAR で処理する (IME やキーボード配列の違いを OS に任せる)
         if input::is_text_key(key) && !mods.ctrl && !mods.alt {
@@ -747,7 +1080,10 @@ impl App {
         }
         let outcome = match self.mode.on_key(chord) {
             ModeResponse::Commands(cmds) => KeyOutcome::Handled(self.execute_commands(cmds)),
-            ModeResponse::Consumed => KeyOutcome::Handled(None),
+            ModeResponse::Consumed => {
+                self.invalidate(); // 入力途中のキーをステータスバーに表示する
+                KeyOutcome::Handled(None)
+            }
             ModeResponse::Unhandled => KeyOutcome::Unhandled,
         };
         if matches!(outcome, KeyOutcome::Handled(_)) {
@@ -774,7 +1110,10 @@ impl App {
         }
         match self.mode.on_text(&text) {
             ModeResponse::Commands(cmds) => self.execute_commands(cmds),
-            _ => None,
+            _ => {
+                self.invalidate();
+                None
+            }
         }
     }
 
@@ -805,6 +1144,20 @@ impl App {
         doc.buffer().line_to_char(line) + col
     }
 
+    /// 画面座標 (DIP) にある URL (Ctrl+クリックで開く対象)。
+    fn url_at(&self, g: &Geometry, x: f32, y: f32) -> Option<String> {
+        if y < g.text_top || y >= g.text_bottom || x < g.text_left {
+            return None;
+        }
+        let pos = self.pos_at(g, x, y);
+        let buf = self.doc().buffer();
+        let line = buf.char_to_line(pos);
+        let col = pos - buf.line_to_char(line);
+        let text = Self::line_text(self.doc(), line);
+        let byte = text.char_indices().nth(col).map(|(b, _)| b)?;
+        link::url_at(&text, byte).map(|r| link::normalize(&text[r]))
+    }
+
     fn select_lines(&mut self, a: usize, b: usize) {
         let buf = self.doc().buffer();
         let (first, last) = (a.min(b), a.max(b));
@@ -824,8 +1177,16 @@ impl App {
         if y < g.text_top || y >= g.text_bottom {
             return None;
         }
+        let mods = input::current_modifiers();
+        if mods.ctrl && !mods.shift && !double {
+            if let Some(url) = self.url_at(&g, x, y) {
+                return Some(Deferred::OpenUrl(url));
+            }
+        }
         unsafe { SetCapture(self.hwnd) };
-        let shift = input::current_modifiers().shift;
+        let shift = mods.shift;
+        // ビジュアルモードの選択はマウス操作で作り直す (離したときに mode.on_mouse へ伝える)
+        vim::leave_visual(self.doc_mut());
         if x < g.gutter_w {
             let line = self.line_at_y(&g, y);
             let anchor_line = if shift { self.doc().buffer().char_to_line(self.doc().selection().anchor) } else { line };
@@ -837,6 +1198,10 @@ impl App {
                 let r = editor::word_at(self.doc().buffer(), pos);
                 self.doc_mut().set_selection(Selection::new(r.start, r.end));
                 self.drag = None;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                self.mouse_selection_done();
             } else {
                 let sel = self.doc().selection().moved_to(pos, shift);
                 self.doc_mut().set_selection(sel);
@@ -850,8 +1215,10 @@ impl App {
 
     pub fn on_mouse_move(&mut self, x: i32, y: i32) {
         self.mouse = self.to_dip(x, y);
-        if self.drag.is_none() {
-            return;
+        match self.drag {
+            None => return,
+            Some(Drag::Tab { idx, start_x, moved }) => return self.drag_tab(idx, start_x, moved),
+            _ => {}
         }
         let g = self.geometry();
         let (_, my) = self.mouse;
@@ -877,17 +1244,52 @@ impl App {
                 let line = self.line_at_y(g, my);
                 self.select_lines(anchor_line, line);
             }
-            None => return,
+            Some(Drag::Tab { .. }) | None => return,
         }
         self.refresh();
     }
 
+    /// タブのドラッグ中: マウスが隣のタブの中央を越えたら入れ替える。
+    fn drag_tab(&mut self, mut idx: usize, start_x: f32, moved: bool) {
+        let (mx, _) = self.mouse;
+        if !moved && (mx - start_x).abs() < TAB_DRAG_THRESHOLD {
+            return;
+        }
+        let mid = |h: &TabHit| (h.left + h.right) / 2.0;
+        loop {
+            let to = if idx > 0 && mx < mid(&self.tab_hits[idx - 1]) {
+                idx - 1
+            } else if idx + 1 < self.tab_hits.len() && mx > mid(&self.tab_hits[idx + 1]) {
+                idx + 1
+            } else {
+                break;
+            };
+            self.move_tab(idx, to);
+            idx = to;
+        }
+        self.drag = Some(Drag::Tab { idx, start_x, moved: true });
+        self.refresh();
+    }
+
     pub fn on_mouse_up(&mut self) {
-        if self.drag.take().is_some() {
-            unsafe {
-                let _ = ReleaseCapture();
-                let _ = KillTimer(Some(self.hwnd), AUTOSCROLL_TIMER);
+        let Some(drag) = self.drag.take() else { return };
+        unsafe {
+            let _ = ReleaseCapture();
+            let _ = KillTimer(Some(self.hwnd), AUTOSCROLL_TIMER);
+        }
+        if !matches!(drag, Drag::Tab { .. }) {
+            self.mouse_selection_done();
+        }
+    }
+
+    /// マウスでの選択が終わったことを入力モードに伝える (Vim はビジュアルモードにする)。
+    fn mouse_selection_done(&mut self) {
+        let has_selection = !self.doc().selection().is_empty();
+        match self.mode.on_mouse(has_selection) {
+            ModeResponse::Commands(cmds) => {
+                let _ = self.execute_commands(cmds);
             }
+            _ => self.after_input(),
         }
     }
 
@@ -923,6 +1325,10 @@ impl App {
             return Some(Deferred::CloseTab(idx));
         }
         self.activate(idx);
+        if self.tab_hits.len() == self.tabs.len() {
+            self.drag = Some(Drag::Tab { idx, start_x: x, moved: false });
+            unsafe { SetCapture(self.hwnd) };
+        }
         self.refresh();
         None
     }
@@ -1005,7 +1411,13 @@ impl App {
     pub fn update_cursor(&self) {
         let g = self.geometry();
         let (x, y) = self.mouse;
-        let id = if y >= g.text_top && y < g.text_bottom && x >= g.gutter_w { IDC_IBEAM } else { IDC_ARROW };
+        let id = if y < g.text_top || y >= g.text_bottom || x < g.gutter_w {
+            IDC_ARROW
+        } else if input::current_modifiers().ctrl && self.drag.is_none() && self.url_at(&g, x, y).is_some() {
+            IDC_HAND
+        } else {
+            IDC_IBEAM
+        };
         unsafe {
             if let Ok(c) = LoadCursorW(None, id) {
                 SetCursor(Some(c));
@@ -1013,40 +1425,116 @@ impl App {
         }
     }
 
+    /// マウスがウィンドウ上にあれば、現在のマウス位置でカーソルの形を更新する。
+    pub fn refresh_cursor(&mut self) {
+        let mut pt = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_err() || WindowFromPoint(pt) != self.hwnd || !ScreenToClient(self.hwnd, &mut pt).as_bool() {
+                return;
+            }
+        }
+        self.mouse = self.to_dip(pt.x, pt.y);
+        self.update_cursor();
+    }
+
     pub fn update_menu(&self) {
-        self.menus.update(self.doc(), self.theme.name == "dark");
+        self.menus.update(self.doc(), self.theme.name == "dark", self.vim_enabled);
     }
 
     // ---- IME ----
 
-    /// 変換中の文字列ウィンドウをキャレット位置に合わせる。
+    /// WM_IME_COMPOSITION。本文への入力では変換中の文字列を自前で描画し、
+    /// 確定した文字列を挿入して `Some` を返す。入力欄への入力では IME の
+    /// 既定の変換ウィンドウに任せるため `None` を返す (呼び出し元は既定処理に渡す)。
+    pub fn on_ime_composition(&mut self, flags: u32) -> Option<Option<Deferred>> {
+        if self.prompt.is_some() {
+            return None;
+        }
+        let has = |f: IME_COMPOSITION_STRING| flags & f.0 != 0;
+        let mut deferred = None;
+        unsafe {
+            let himc = ImmGetContext(self.hwnd);
+            if himc.is_invalid() {
+                return None;
+            }
+            if has(GCS_RESULTSTR) {
+                let result = ime_string(himc, GCS_RESULTSTR);
+                if !result.is_empty() {
+                    self.ime = None;
+                    if let ModeResponse::Commands(cmds) = self.mode.on_text(&result) {
+                        deferred = self.execute_commands(cmds);
+                    }
+                }
+            }
+            if has(GCS_COMPSTR) {
+                let text = ime_string(himc, GCS_COMPSTR);
+                self.ime = if text.is_empty() {
+                    None
+                } else {
+                    let len16 = text.encode_utf16().count();
+                    let cursor = if has(GCS_CURSORPOS) {
+                        (ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0).max(0) as usize).min(len16)
+                    } else {
+                        len16
+                    };
+                    let target = if has(GCS_COMPATTR) { ime_target(himc) } else { None };
+                    Some(ImeComposition { text, cursor, target })
+                };
+            }
+            let _ = ImmReleaseContext(self.hwnd, himc);
+        }
+        self.position_ime();
+        self.invalidate();
+        Some(deferred)
+    }
+
+    /// WM_IME_ENDCOMPOSITION。変換中の表示を消す。
+    pub fn end_ime_composition(&mut self) {
+        if self.ime.take().is_some() {
+            self.invalidate();
+        }
+    }
+
+    /// 変換ウィンドウ・候補ウィンドウの位置と書体をキャレットに合わせる。
     pub fn position_ime(&self) {
         let g = self.geometry();
         let r = &self.renderer;
-        let (x, y) = if let Some(p) = &self.prompt {
+        let (x, y) = if let Some(p) = self.prompt.as_ref().filter(|p| p.in_status_bar()) {
+            let x = status_prompt_text_left(self) + r.text_width(&p.text[..p.cursor], &r.ui_format);
+            (x, g.status_top + (g.height - g.status_top - r.ui_line_height) / 2.0)
+        } else if let Some(p) = &self.prompt {
             let x = prompt_input_left(self, &g) + 4.0 + r.text_width(&p.text[..p.cursor], &r.text_format);
             (x, g.prompt_top + (g.status_top - g.prompt_top - r.line_height) / 2.0)
         } else {
             let doc = self.doc();
-            let (line, col) = doc.buffer().line_col(doc.selection().head);
+            let (line, col) = doc.buffer().line_col(doc.caret_pos());
             let x = g.text_left - self.tab().scroll_x + self.col_x(line, col);
             let y = g.text_top + (line as f32 - self.tab().scroll_line as f32) * r.line_height;
             (x, y)
         };
         let s = r.scale();
+        let pt = POINT { x: (x * s) as i32, y: (y * s) as i32 };
         unsafe {
             let himc = ImmGetContext(self.hwnd);
             if himc.is_invalid() {
                 return;
             }
-            let cf = COMPOSITIONFORM {
-                dwStyle: CFS_POINT,
-                ptCurrentPos: POINT { x: (x * s) as i32, y: (y * s) as i32 },
-                rcArea: RECT::default(),
-            };
+            let cf = COMPOSITIONFORM { dwStyle: CFS_POINT, ptCurrentPos: pt, rcArea: RECT::default() };
             let _ = ImmSetCompositionWindow(himc, &cf);
-            let mut lf = LOGFONTW { lfHeight: -((r.font_size * s) as i32), ..Default::default() };
-            for (dst, src) in lf.lfFaceName.iter_mut().zip("Consolas".encode_utf16()) {
+            // 候補ウィンドウが入力中の行を隠さないよう、行の矩形を除外領域にする
+            let cand = CANDIDATEFORM {
+                dwIndex: 0,
+                dwStyle: CFS_EXCLUDE,
+                ptCurrentPos: pt,
+                rcArea: RECT { left: pt.x, top: pt.y, right: pt.x + 1, bottom: ((y + r.line_height) * s) as i32 },
+            };
+            let _ = ImmSetCandidateWindow(himc, &cand);
+            let mut lf = LOGFONTW {
+                lfHeight: -((r.font_size * s) as i32),
+                lfCharSet: SHIFTJIS_CHARSET,
+                ..Default::default()
+            };
+            for (dst, src) in lf.lfFaceName.iter_mut().zip("MS Gothic".encode_utf16()) {
                 *dst = src;
             }
             let _ = ImmSetCompositionFontW(himc, &lf);
@@ -1055,11 +1543,56 @@ impl App {
     }
 }
 
+/// 変換中・確定した文字列を取り出す。
+unsafe fn ime_string(himc: HIMC, kind: IME_COMPOSITION_STRING) -> String {
+    let bytes = unsafe { ImmGetCompositionStringW(himc, kind, None, 0) };
+    if bytes <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; bytes as usize / 2];
+    unsafe { ImmGetCompositionStringW(himc, kind, Some(buf.as_mut_ptr().cast()), bytes as u32) };
+    String::from_utf16_lossy(&buf)
+}
+
+/// 変換中の文字列のうち、変換対象の文節 (UTF-16 の範囲)。
+unsafe fn ime_target(himc: HIMC) -> Option<std::ops::Range<usize>> {
+    let len = unsafe { ImmGetCompositionStringW(himc, GCS_COMPATTR, None, 0) };
+    if len <= 0 {
+        return None;
+    }
+    let mut attrs = vec![0u8; len as usize];
+    unsafe { ImmGetCompositionStringW(himc, GCS_COMPATTR, Some(attrs.as_mut_ptr().cast()), len as u32) };
+    let is_target = |a: &u8| matches!(*a as u32, ATTR_TARGET_CONVERTED | ATTR_TARGET_NOTCONVERTED);
+    let start = attrs.iter().position(is_target)?;
+    let end = attrs[start..].iter().position(|a| !is_target(a)).map_or(attrs.len(), |n| start + n);
+    Some(start..end)
+}
+
+/// ステータスバーに表示する入力欄 (Vim の `:` など) の、入力文字列の左端。
+pub fn status_prompt_text_left(app: &App) -> f32 {
+    let r = &app.renderer;
+    let label = app.prompt.as_ref().map_or("", |p| p.label());
+    12.0 + r.text_width(label, &r.ui_format)
+}
+
 /// 入力欄のテキスト領域の左端 (paint.rs と IME 位置計算で共有)。
 pub fn prompt_input_left(app: &App, _g: &Geometry) -> f32 {
     let r = &app.renderer;
     let label = app.prompt.as_ref().map_or("", |p| p.label());
     12.0 + r.text_width(label, &r.ui_format) + 10.0
+}
+
+/// タブを `from` から `to` へ移したとき、位置 `i` にあったタブの新しい位置。
+fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < i && i <= to {
+        i - 1
+    } else if to <= i && i < from {
+        i + 1
+    } else {
+        i
+    }
 }
 
 fn set_wait_cursor() {

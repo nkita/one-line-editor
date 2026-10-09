@@ -1,7 +1,8 @@
 //! 画面の描画 (WM_PAINT)。見えている行だけを 1 行ずつレイアウトして描く。
 
 use lvt_core::keymap::CaretStyle;
-use lvt_core::syntax::StyleSpan;
+use lvt_core::link;
+use lvt_core::syntax::{StyleSpan, TokenKind};
 use lvt_core::theme::Theme;
 use regex::Regex;
 use windows::Win32::Graphics::DirectWrite::{
@@ -9,7 +10,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_TEXT_RANGE,
 };
 
-use super::app::{prompt_input_left, App, Geometry, Tab, TabHit};
+use super::app::{prompt_input_left, status_prompt_text_left, App, Geometry, ImeComposition, Tab, TabHit};
 use super::render::Renderer;
 use super::util::{byte_to_utf16, char_to_utf16};
 
@@ -17,6 +18,7 @@ struct TextCtx<'a> {
     focused: bool,
     caret: CaretStyle,
     matches: Option<&'a Regex>,
+    ime: Option<&'a ImeComposition>,
 }
 
 impl App {
@@ -32,12 +34,13 @@ impl App {
             focused: self.focused,
             caret: self.mode.caret_style(),
             matches: if self.highlight_matches { self.search_re.as_ref() } else { None },
+            ime: self.ime.as_ref(),
         };
         let tab = &mut self.tabs[self.active];
         paint_text(&mut self.renderer, tab, &g, &theme, &ctx);
 
         self.paint_tabbar(&g, &theme);
-        if self.prompt.is_some() {
+        if self.prompt.as_ref().is_some_and(|p| !p.in_status_bar()) {
             self.paint_prompt(&g, &theme);
         }
         self.paint_status(&g, &theme);
@@ -113,7 +116,7 @@ impl App {
     fn paint_status(&mut self, g: &Geometry, theme: &Theme) {
         let doc = &self.tabs[self.active].doc;
         let sel = doc.selection();
-        let (line, col) = doc.buffer().line_col(sel.head);
+        let (line, col) = doc.buffer().line_col(doc.caret_pos());
         let left = self.status.clone().unwrap_or_else(|| {
             let mut s = format!("{} 行, {} 桁", line + 1, col + 1);
             if !sel.is_empty() {
@@ -121,20 +124,41 @@ impl App {
             }
             s
         });
+        let mode = self.mode.name();
         let mut right: Vec<&str> = Vec::new();
-        if !self.mode.name().is_empty() {
-            right.push(self.mode.name());
+        if !mode.is_empty() {
+            right.push(&mode);
         }
         right.extend([doc.highlighter_name(), doc.encoding.name(), doc.line_ending.name()]);
         let right = right.join("    ");
 
+        // Vim の `:` `/` `?` は、行・桁の代わりにステータスバーで入力する
+        let status_prompt = self.prompt.as_ref().filter(|p| p.in_status_bar()).map(|p| (p.label(), p.text.clone(), p.cursor));
+        let text_left = status_prompt_text_left(self);
         let r = &mut self.renderer;
         let (top, bottom) = (g.status_top, g.height);
         r.fill(0.0, top, g.width, bottom, theme.chrome_bg);
         r.fill(0.0, top, g.width, top + 1.0, theme.tab_inactive_bg);
         let rw = r.text_width(&right, &r.ui_format);
         r.push_clip(0.0, top, (g.width - rw - 24.0).max(0.0), bottom);
-        r.draw_ui_text(&left, 12.0, top, bottom - top, theme.chrome_fg);
+        match status_prompt {
+            Some((label, text, cursor)) => {
+                r.draw_ui_text(label, 12.0, top, bottom - top, theme.foreground);
+                if let Some(layout) = r.layout_str(&text, &r.ui_format.clone()) {
+                    unsafe {
+                        let _ = layout.SetMaxHeight(bottom - top);
+                        let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    }
+                    r.draw_layout(&layout, text_left, top, theme.foreground);
+                    let cx = text_left + Renderer::x_of(&layout, byte_to_utf16(&text, cursor));
+                    let cy = top + (bottom - top - r.ui_line_height) / 2.0;
+                    r.fill(cx, cy, cx + 1.5, cy + r.ui_line_height, theme.caret);
+                }
+            }
+            None => {
+                r.draw_ui_text(&left, 12.0, top, bottom - top, theme.chrome_fg);
+            }
+        }
         r.pop_clip();
         r.draw_ui_text(&right, g.width - rw - 12.0, top, bottom - top, theme.chrome_fg);
     }
@@ -144,7 +168,7 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
     let lh = r.line_height;
     let cw = r.char_width;
     let sel = tab.doc.selection();
-    let (caret_line, caret_col) = tab.doc.buffer().line_col(sel.head);
+    let (caret_line, caret_col) = tab.doc.buffer().line_col(tab.doc.caret_pos());
     let len_lines = tab.doc.buffer().len_lines();
     let rows = ((g.text_bottom - g.text_top) / lh).ceil() as usize + 1;
     let origin_x = g.text_left - tab.scroll_x;
@@ -162,7 +186,20 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         let line_start = tab.doc.buffer().line_to_char(line);
         let line_len = tab.doc.buffer().line_len(line);
         let text = App::line_text(&tab.doc, line);
-        let u: Vec<u16> = text.encode_utf16().collect();
+        // IME で変換中の文字列はキャレット位置に埋め込んで描く。
+        // 文書上の位置 (UTF-16) → 表示上の位置は `to_view` で変換する。
+        let ime = ctx.ime.filter(|_| line == caret_line);
+        let ime_at = char_to_utf16(&text, caret_col);
+        let ime_len = ime.map_or(0, |c| c.text.encode_utf16().count());
+        let to_view = |p16: usize| if p16 >= ime_at { p16 + ime_len } else { p16 };
+        let view_text = match ime {
+            Some(c) => {
+                let at = text.char_indices().nth(caret_col).map_or(text.len(), |(b, _)| b);
+                format!("{}{}{}", &text[..at], c.text, &text[at..])
+            }
+            None => text.clone(),
+        };
+        let u: Vec<u16> = view_text.encode_utf16().collect();
         let Some(layout) = r.layout(&u, &format) else { continue };
         unsafe {
             let _ = layout.SetMaxHeight(lh);
@@ -170,18 +207,25 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         }
         // 太字などで文字幅が変わるので、位置計算より先に書式を適用する
         spans.clear();
-        tab.doc.highlight_line(line, &text, &mut spans);
-        apply_styles(r, &layout, &text, &spans, theme);
+        tab.doc.highlight_line(line, &view_text, &mut spans);
+        spans.extend(link::find_urls(&view_text).into_iter().map(|range| StyleSpan { range, kind: TokenKind::Link }));
+        apply_styles(r, &layout, &view_text, &spans, theme);
+        if ime.is_some() {
+            let range = DWRITE_TEXT_RANGE { startPosition: ime_at as u32, length: ime_len as u32 };
+            unsafe {
+                let _ = layout.SetUnderline(true, range);
+            }
+        }
         tab.max_width = tab.max_width.max(Renderer::layout_width(&layout));
-        let x_at = |col: usize| origin_x + Renderer::x_of(&layout, char_to_utf16(&text, col));
+        let x_at = |col: usize| origin_x + Renderer::x_of(&layout, to_view(char_to_utf16(&text, col)));
 
         if line == caret_line && sel.is_empty() {
             r.fill(g.gutter_w, y, g.width, y + lh, theme.current_line);
         }
         if let Some(re) = ctx.matches {
             for m in re.find_iter(&text).filter(|m| !m.is_empty()) {
-                let x0 = origin_x + Renderer::x_of(&layout, byte_to_utf16(&text, m.start()));
-                let x1 = origin_x + Renderer::x_of(&layout, byte_to_utf16(&text, m.end()));
+                let x0 = origin_x + Renderer::x_of(&layout, to_view(byte_to_utf16(&text, m.start())));
+                let x1 = origin_x + Renderer::x_of(&layout, to_view(byte_to_utf16(&text, m.end())));
                 r.fill(x0, y, x1, y + lh, theme.search_match);
             }
         }
@@ -194,15 +238,23 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
             }
             r.fill(x_at(c0), y, x1, y + lh, theme.selection);
         }
-        if line == caret_line && ctx.focused && ctx.caret == CaretStyle::Block {
-            let x = x_at(caret_col);
-            r.fill(x, y, x + cw, y + lh, theme.selection);
+        // 変換中のキャレット位置 (変換中の文字列内のカーソル)
+        let caret_x = match ime {
+            Some(c) => origin_x + Renderer::x_of(&layout, ime_at + c.cursor),
+            None => x_at(caret_col),
+        };
+        if let Some(t) = ime.and_then(|c| c.target.clone()) {
+            let x0 = origin_x + Renderer::x_of(&layout, ime_at + t.start);
+            let x1 = origin_x + Renderer::x_of(&layout, ime_at + t.end);
+            r.fill(x0, y, x1, y + lh, theme.selection);
+        } else if line == caret_line && ctx.focused && ctx.caret == CaretStyle::Block {
+            r.fill(caret_x, y, caret_x + cw, y + lh, theme.selection);
         }
 
         r.draw_layout(&layout, origin_x, y, theme.foreground);
 
         if line == caret_line && ctx.focused {
-            let x = x_at(caret_col);
+            let x = caret_x;
             let px = 1.0 / r.scale();
             match ctx.caret {
                 CaretStyle::Bar => r.fill(x, y, x + (2.0 * px).max(1.5), y + lh, theme.caret),

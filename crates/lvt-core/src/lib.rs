@@ -16,10 +16,13 @@ pub mod editor;
 pub mod encoding;
 pub mod history;
 pub mod keymap;
+pub mod link;
 pub mod search;
 pub mod selection;
+pub mod settings;
 pub mod syntax;
 pub mod theme;
+pub mod vim;
 pub mod width;
 
 pub use buffer::TextBuffer;

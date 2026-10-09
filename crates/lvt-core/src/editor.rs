@@ -7,6 +7,7 @@ use crate::command::{EditCommand, Motion};
 use crate::document::Document;
 use crate::history::MergeKind;
 use crate::selection::Selection;
+use crate::vim::{self, Register};
 use crate::width::{self, char_class, CharClass};
 
 #[derive(Clone, Debug)]
@@ -29,11 +30,15 @@ impl Default for EditorConfig {
 pub struct ViewInfo {
     /// 1 画面に表示できる行数 (PageUp/PageDown の移動量)。
     pub page_lines: usize,
+    /// 画面の先頭に表示している行 (Vim の H / M / L で使う)。
+    pub top_line: usize,
 }
 
-pub fn execute(doc: &mut Document, cmd: &EditCommand, cfg: &EditorConfig, view: &ViewInfo) {
+/// コマンドを実行する。ヤンク・削除した文字列 (Vim) があれば返す。
+pub fn execute(doc: &mut Document, cmd: &EditCommand, cfg: &EditorConfig, view: &ViewInfo) -> Option<Register> {
     use EditCommand as E;
     match cmd {
+        E::Vim(v) => return vim::execute(doc, v, cfg, view),
         E::Move { motion, extend } => move_caret(doc, *motion, *extend, cfg, view),
         E::SelectAll => {
             let len = doc.buffer().len_chars();
@@ -66,6 +71,7 @@ pub fn execute(doc: &mut Document, cmd: &EditCommand, cfg: &EditorConfig, view: 
             doc.redo();
         }
     }
+    None
 }
 
 // ---- 移動 ----
@@ -108,12 +114,12 @@ fn move_caret(doc: &mut Document, motion: Motion, extend: bool, cfg: &EditorConf
     doc.preferred_col = vertical.then_some(pref);
 }
 
-fn current_display_col(buf: &TextBuffer, pos: usize, tab: usize) -> usize {
+pub(crate) fn current_display_col(buf: &TextBuffer, pos: usize, tab: usize) -> usize {
     let (line, col) = buf.line_col(pos);
     width::display_col(buf.line(line).chars(), col, tab)
 }
 
-fn pos_at_display_col(buf: &TextBuffer, line: usize, col: usize, tab: usize) -> usize {
+pub(crate) fn pos_at_display_col(buf: &TextBuffer, line: usize, col: usize, tab: usize) -> usize {
     buf.line_to_char(line) + width::char_col_at_display(buf.line(line).chars(), col, tab)
 }
 
@@ -176,13 +182,13 @@ pub fn word_at(buf: &TextBuffer, pos: usize) -> Range<usize> {
 
 // ---- 入力・削除 ----
 
-fn leading_indent(doc: &Document) -> String {
+pub(crate) fn leading_indent(doc: &Document) -> String {
     let buf = doc.buffer();
     let (line, col) = buf.line_col(doc.selection().start());
     buf.line(line).chars().take(col).take_while(|c| *c == ' ' || *c == '\t').collect()
 }
 
-fn indent_unit(cfg: &EditorConfig, display_col: usize) -> String {
+pub(crate) fn indent_unit(cfg: &EditorConfig, display_col: usize) -> String {
     if cfg.insert_spaces {
         let tw = cfg.tab_width.max(1);
         " ".repeat(tw - display_col % tw)
@@ -247,7 +253,7 @@ fn outdent(doc: &mut Document, cfg: &EditorConfig) {
 }
 
 /// 行頭から取り除くインデントの文字数 (タブ 1 個、または最大 tab_width 個の空白)。
-fn outdent_len(buf: &TextBuffer, line: usize, tab_width: usize) -> usize {
+pub(crate) fn outdent_len(buf: &TextBuffer, line: usize, tab_width: usize) -> usize {
     let mut n = 0;
     for c in buf.line(line).chars() {
         match c {
@@ -299,7 +305,7 @@ fn duplicate(doc: &mut Document) {
 mod tests {
     use super::*;
 
-    const VIEW: ViewInfo = ViewInfo { page_lines: 10 };
+    const VIEW: ViewInfo = ViewInfo { page_lines: 10, top_line: 0 };
 
     fn run(doc: &mut Document, cmds: &[EditCommand]) {
         let cfg = EditorConfig::default();

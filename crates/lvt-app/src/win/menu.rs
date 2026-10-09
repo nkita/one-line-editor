@@ -60,6 +60,7 @@ impl Menus {
         m.item(view, "既定のサイズ(&R)", A::ZoomReset, mode)?;
         m.separator(view)?;
         m.item(view, "ダークテーマ(&D)", A::ToggleTheme, mode)?;
+        m.item(view, "Vim キーバインド(&V)", A::ToggleVim, mode)?;
 
         let enc = m.popup(m.bar, "文字コード(&C)")?;
         let reopen = m.popup(enc, "指定した文字コードで開き直す(&R)")?;
@@ -105,13 +106,14 @@ impl Menus {
     }
 
     /// メニューを開く直前にチェック状態・有効状態を更新する。
-    pub fn update(&self, doc: &Document, dark: bool) {
+    pub fn update(&self, doc: &Document, dark: bool, vim: bool) {
         for (i, cmd) in self.items.iter().enumerate() {
             let id = (FIRST_ID + i) as u32;
             let checked = match cmd {
                 Command::App(AppCommand::SetSaveEncoding(e)) => Some(*e == doc.encoding),
                 Command::App(AppCommand::SetLineEnding(e)) => Some(*e == doc.line_ending),
                 Command::App(AppCommand::ToggleTheme) => Some(dark),
+                Command::App(AppCommand::ToggleVim) => Some(vim),
                 _ => None,
             };
             let enabled = match cmd {

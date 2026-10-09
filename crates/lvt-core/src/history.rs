@@ -40,6 +40,8 @@ pub struct History {
     saved_id: u64,
     /// 保存時点の状態に戻れなくなったか (redo が破棄されたなど)。
     saved_unreachable: bool,
+    /// まとめ中なら Some。中身は、まとめ用のトランザクションを作成済みか。
+    group: Option<bool>,
 }
 
 impl History {
@@ -58,6 +60,20 @@ impl History {
     pub fn mark_saved(&mut self) {
         self.saved_id = self.top_id();
         self.saved_unreachable = false;
+        self.last_merge = None;
+        // 保存後の変更が保存済みのトランザクションに混ざらないようにする
+        if let Some(started) = &mut self.group {
+            *started = false;
+        }
+    }
+
+    /// これ以降 `end_group` までの変更を 1 つのトランザクションにまとめる (Vim の挿入など)。
+    pub fn begin_group(&mut self) {
+        self.group = Some(false);
+    }
+
+    pub fn end_group(&mut self) {
+        self.group = None;
         self.last_merge = None;
     }
 
@@ -78,7 +94,7 @@ impl History {
             }
             self.redo.clear();
         }
-        let can_merge = merge != MergeKind::None && self.last_merge == Some(merge);
+        let can_merge = self.group == Some(true) || (merge != MergeKind::None && self.last_merge == Some(merge));
         if can_merge {
             if let Some(top) = self.undo.last_mut() {
                 top.edits.extend(edits);
@@ -90,10 +106,13 @@ impl History {
         self.next_id += 1;
         self.undo.push(Transaction { id, edits, before, after });
         self.last_merge = Some(merge);
+        if let Some(started) = &mut self.group {
+            *started = true;
+        }
     }
 
     pub fn pop_undo(&mut self) -> Option<Transaction> {
-        self.last_merge = None;
+        self.end_group();
         let t = self.undo.pop()?;
         Some(t)
     }
@@ -103,7 +122,7 @@ impl History {
     }
 
     pub fn pop_redo(&mut self) -> Option<Transaction> {
-        self.last_merge = None;
+        self.end_group();
         self.redo.pop()
     }
 

@@ -13,13 +13,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use lvt_core::encoding::{SaveError, TextEncoding};
-use lvt_core::keymap::{InputMode, StandardMode};
+use lvt_core::settings::Settings;
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -69,8 +70,10 @@ fn start() -> Result<()> {
             return Err(windows::core::Error::from_thread());
         }
 
-        // 入力モードの差し替え (将来の Vim モード等) はここで行う
-        let mode: Box<dyn InputMode> = Box::new(StandardMode::default());
+        // 入力モード (標準 / Vim) は前回の設定を引き継ぐ
+        let settings_path = app::settings_path();
+        let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
+        let mode = app::make_mode(app::vim_by_default(&settings));
         let menus = Menus::build(mode.as_ref())?;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -86,7 +89,7 @@ fn start() -> Result<()> {
             Some(hinst),
             None,
         )?;
-        let app = App::new(hwnd, mode, menus)?;
+        let app = App::new(hwnd, mode, menus, settings, settings_path)?;
         APP.with(|c| *c.borrow_mut() = Some(app));
         DragAcceptFiles(hwnd, true);
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -128,6 +131,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 a.invalidate();
             });
             true
+        }
+        // Ctrl の押下・解放で、リンク上のカーソル (手の形) を切り替える
+        WM_KEYDOWN | WM_KEYUP if wp.0 == VK_CONTROL.0 as usize => {
+            with_app(|a| a.refresh_cursor());
+            false
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => match with_app(|a| a.on_key_down(loword(wp.0))) {
             Some(KeyOutcome::Handled(d)) => {
@@ -185,7 +193,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_COMMAND => {
             if let Some(cmd) = with_app(|a| a.menus.command(loword(wp.0))).flatten() {
-                if let Some(d) = with_app(|a| a.execute(cmd)).flatten() {
+                if let Some(d) = with_app(|a| a.execute_commands(vec![cmd])).flatten() {
                     run_deferred(hwnd, d);
                 }
             }
@@ -195,9 +203,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             with_app(|a| a.update_menu());
             true
         }
-        WM_IME_STARTCOMPOSITION => {
-            with_app(|a| a.position_ime());
-            false // 既定処理で変換ウィンドウを表示させる
+        // 本文への入力では変換中の文字列を自前で描画するので、既定処理 (IME の
+        // 変換ウィンドウ) に渡さない。入力欄では既定処理に任せる。
+        WM_IME_STARTCOMPOSITION => with_app(|a| {
+            a.position_ime();
+            a.prompt.is_none()
+        })
+        .unwrap_or(false),
+        WM_IME_COMPOSITION => match with_app(|a| a.on_ime_composition(lp.0 as u32)).flatten() {
+            Some(d) => {
+                if let Some(d) = d {
+                    run_deferred(hwnd, d);
+                }
+                true
+            }
+            None => false,
+        },
+        WM_IME_ENDCOMPOSITION => {
+            with_app(|a| a.end_ime_composition());
+            false
         }
         WM_DROPFILES => {
             let paths = dropped_files(HDROP(wp.0 as _));
@@ -283,6 +307,26 @@ fn run_deferred(hwnd: HWND, d: Deferred) {
             }
         }
         Deferred::Reopen(enc) => reopen(hwnd, enc),
+        Deferred::OpenUrl(url) => dialogs::open_url(hwnd, &url),
+        Deferred::Quit { idx, save: write, force } => {
+            if write && !save(hwnd, idx, false) {
+                with_app(|a| a.refresh());
+                return;
+            }
+            let last_tab = with_app(|a| a.tabs.len()).unwrap_or(0) <= 1;
+            if last_tab {
+                if force || confirm_close_all(hwnd) {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    return;
+                }
+            } else if force {
+                with_app(|a| a.remove_tab(idx));
+            } else {
+                close_tab(hwnd, idx);
+            }
+        }
     }
     with_app(|a| a.refresh());
 }

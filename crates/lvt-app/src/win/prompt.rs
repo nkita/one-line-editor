@@ -1,6 +1,6 @@
 //! 画面下部の 1 行入力欄 (検索・置換・行移動)。
 //!
-//! 将来 Vim の `:` コマンドラインもこの仕組みを流用する想定。
+//! Vim の `:` コマンドラインと `/` `?` もこの仕組みを使う。
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
@@ -10,6 +10,10 @@ pub enum PromptKind {
     /// 置換: 置換後文字列の入力
     ReplaceWith { find: String },
     GoToLine,
+    /// Vim の `:` コマンドライン。`visual` はビジュアルモードで選択していた行 (0 始まり)。
+    Command { visual: Option<(usize, usize)> },
+    /// Vim の `/` (forward) と `?`。Enter で検索して閉じる。
+    VimSearch { forward: bool },
 }
 
 pub struct Prompt {
@@ -33,11 +37,19 @@ impl Prompt {
             PromptKind::ReplaceFind => "置換する文字列",
             PromptKind::ReplaceWith { .. } => "置換後の文字列",
             PromptKind::GoToLine => "行番号 (行:桁)",
+            PromptKind::Command { .. } => ":",
+            PromptKind::VimSearch { forward: true } => "/",
+            PromptKind::VimSearch { forward: false } => "?",
         }
     }
 
+    /// ステータスバーの行・桁の位置に表示する入力欄か (Vim の `:` `/` `?`)。
+    pub fn in_status_bar(&self) -> bool {
+        matches!(self.kind, PromptKind::Command { .. } | PromptKind::VimSearch { .. })
+    }
+
     pub fn is_search(&self) -> bool {
-        matches!(self.kind, PromptKind::Find | PromptKind::ReplaceFind)
+        matches!(self.kind, PromptKind::Find | PromptKind::ReplaceFind | PromptKind::VimSearch { .. })
     }
 
     pub fn insert(&mut self, s: &str) {

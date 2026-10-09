@@ -150,3 +150,26 @@ pub fn get_clipboard(hwnd: HWND) -> Option<String> {
         text.map(|s| s.replace("\r\n", "\n").replace('\r', "\n"))
     }
 }
+
+/// URL を既定のブラウザで開く。http / https 以外は開かない (任意のファイルの実行を防ぐ)。
+pub fn open_url(hwnd: HWND, url: &str) {
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return;
+    }
+    let w = wide(url);
+    let r = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            Some(hwnd),
+            windows::core::w!("open"),
+            PCWSTR(w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // 32 以下はエラー
+    if r.0 as usize <= 32 {
+        error(hwnd, &format!("URL を開けませんでした:\n{url}"));
+    }
+}
