@@ -1,0 +1,11 @@
+# WSL から Windows 向けにクロスビルドする設定。
+# `cargo build-win` / `cargo build-win-release` で x86_64-pc-windows-gnu 向けにビルドする。
+[alias]
+build-win = "build -p lvt-app --target x86_64-pc-windows-gnu"
+build-win-release = "build -p lvt-app --target x86_64-pc-windows-gnu --release"
+check-win = "clippy -p lvt-app --target x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# MinGW ランタイム DLL に依存しない単体 exe にする
+rustflags = ["-C", "target-feature=+crt-static"]

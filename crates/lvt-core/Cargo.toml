@@ -1,0 +1,13 @@
+[package]
+name = "lvt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform independent editor core (buffer, commands, keymaps, search, highlighting)"
+
+[dependencies]
+ropey.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+regex.workspace = true
+unicode-width.workspace = true
