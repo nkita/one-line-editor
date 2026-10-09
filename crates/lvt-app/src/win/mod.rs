@@ -1,6 +1,7 @@
 //! Windows フロントエンドの入口: ウィンドウ生成・メッセージ処理・ダイアログを伴う処理。
 
 mod app;
+mod detail_editor;
 mod dialogs;
 mod input;
 mod menu;
@@ -308,6 +309,14 @@ fn run_deferred(hwnd: HWND, d: Deferred) {
         }
         Deferred::Reopen(enc) => reopen(hwnd, enc),
         Deferred::OpenUrl(url) => dialogs::open_url(hwnd, &url),
+        Deferred::EditDetail { idx, line } => {
+            if let Some(initial) = with_app(|a| a.detail_text(idx, line)).flatten() {
+                let title = format!("詳細の編集 ({} 行目)", line + 1);
+                if let Some(text) = detail_editor::edit(hwnd, &title, &initial) {
+                    with_app(|a| a.write_detail(idx, line, &text));
+                }
+            }
+        }
         Deferred::Quit { idx, save: write, force } => {
             if write && !save(hwnd, idx, false) {
                 with_app(|a| a.refresh());

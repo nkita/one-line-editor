@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::util::wide;
 
 const APP_NAME: &str = "lvt";
-const FILTER: &str = "すべてのファイル (*.*)\0*.*\0テキスト (*.txt)\0*.txt\0Markdown (*.md)\0*.md;*.markdown\0\0";
+const FILTER: &str = "すべてのファイル (*.*)\0*.*\0テキスト (*.txt)\0*.txt\0Markdown (*.md)\0*.md;*.markdown\0lvt ノート (*.lvt)\0*.lvt\0\0";
 
 pub fn open_files(hwnd: HWND) -> Vec<PathBuf> {
     let filter: Vec<u16> = FILTER.encode_utf16().collect();

@@ -85,7 +85,7 @@ fn cursor(doc: &Document) -> usize {
 }
 
 fn ctx<'a>(doc: &'a Document, cfg: &'a EditorConfig, view: &'a ViewInfo) -> Ctx<'a> {
-    Ctx { buf: doc.buffer(), cfg, view, pref: doc.preferred_col }
+    Ctx { buf: doc.buffer(), cfg, view, pref: doc.preferred_col, detail_view: doc.detail_view() }
 }
 
 fn move_cursor(doc: &mut Document, m: VimMotion, count: Option<usize>, cfg: &EditorConfig, view: &ViewInfo) {
@@ -188,6 +188,11 @@ fn operate(
         }
         OpTarget::Object { obj, inner } => Span::Chars(motion::object_range(buf, pos, obj, inner, n)?),
         OpTarget::Motion(m) => motion_span(doc, op, m, count, cfg, view)?,
+    };
+    // 詳細に一部だけかかる場合は詳細全体を対象にする (ヤンクする文字列も合わせる)
+    let span = match span {
+        Span::Chars(r) => Span::Chars(doc.expand_range(r)),
+        lines => lines,
     };
     doc.visual = None;
     let reg = apply_op(doc, op, span, pos, cfg);

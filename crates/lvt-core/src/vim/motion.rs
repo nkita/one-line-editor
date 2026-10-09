@@ -67,6 +67,8 @@ pub struct Ctx<'a> {
     pub view: &'a ViewInfo,
     /// 現在維持している表示桁。
     pub pref: Option<usize>,
+    /// 詳細 (`*[…]`) を折りたたんで表示しているか (表示桁の数え方が変わる)。
+    pub detail_view: bool,
 }
 
 /// `pos` から `motion` を `count` 回 (G などでは行番号) 適用した移動先。移動できなければ None。
@@ -77,7 +79,8 @@ pub fn target(ctx: &Ctx, pos: usize, motion: VimMotion, count: Option<usize>) ->
     let (line, _) = buf.line_col(pos);
     let last_line = buf.len_lines() - 1;
     let tab = ctx.cfg.tab_width;
-    let pref = ctx.pref.unwrap_or_else(|| current_display_col(buf, pos, tab));
+    let dv = ctx.detail_view;
+    let pref = ctx.pref.unwrap_or_else(|| current_display_col(buf, pos, tab, dv));
     let to_line = |l: usize| first_nonblank(buf, l.min(last_line));
     let pos = match motion {
         M::Left => {
@@ -103,7 +106,7 @@ pub fn target(ctx: &Ctx, pos: usize, motion: VimMotion, count: Option<usize>) ->
             if line == 0 {
                 return None;
             }
-            pos_at_display_col(buf, line.saturating_sub(step), pref, tab)
+            pos_at_display_col(buf, line.saturating_sub(step), pref, tab, dv)
         }
         M::Down | M::HalfPageDown | M::PageDown => {
             let step = match motion {
@@ -114,7 +117,7 @@ pub fn target(ctx: &Ctx, pos: usize, motion: VimMotion, count: Option<usize>) ->
             if line >= last_line {
                 return None;
             }
-            pos_at_display_col(buf, (line + step).min(last_line), pref, tab)
+            pos_at_display_col(buf, (line + step).min(last_line), pref, tab, dv)
         }
         M::WordStart { big } => repeat(pos, n, |p| next_word_start(buf, p, big)),
         M::WordEnd { big } => repeat(pos, n, |p| next_word_end(buf, p, big)),

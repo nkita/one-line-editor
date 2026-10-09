@@ -61,6 +61,9 @@ impl Menus {
         m.separator(view)?;
         m.item(view, "ダークテーマ(&D)", A::ToggleTheme, mode)?;
         m.item(view, "Vim キーバインド(&V)", A::ToggleVim, mode)?;
+        m.separator(view)?;
+        m.item(view, "詳細を編集(&E)...", A::EditDetail, mode)?;
+        m.item(view, ".txt で詳細ビューを使う(&T)", A::ToggleTxtDetailView, mode)?;
 
         let enc = m.popup(m.bar, "文字コード(&C)")?;
         let reopen = m.popup(enc, "指定した文字コードで開き直す(&R)")?;
@@ -106,7 +109,7 @@ impl Menus {
     }
 
     /// メニューを開く直前にチェック状態・有効状態を更新する。
-    pub fn update(&self, doc: &Document, dark: bool, vim: bool) {
+    pub fn update(&self, doc: &Document, dark: bool, vim: bool, txt_detail: bool) {
         for (i, cmd) in self.items.iter().enumerate() {
             let id = (FIRST_ID + i) as u32;
             let checked = match cmd {
@@ -114,6 +117,7 @@ impl Menus {
                 Command::App(AppCommand::SetLineEnding(e)) => Some(*e == doc.line_ending),
                 Command::App(AppCommand::ToggleTheme) => Some(dark),
                 Command::App(AppCommand::ToggleVim) => Some(vim),
+                Command::App(AppCommand::ToggleTxtDetailView) => Some(txt_detail),
                 _ => None,
             };
             let enabled = match cmd {
@@ -121,6 +125,7 @@ impl Menus {
                 Command::Edit(EditCommand::Redo) => Some(doc.can_redo()),
                 Command::App(AppCommand::Cut | AppCommand::Copy) => Some(!doc.selection().is_empty()),
                 Command::App(AppCommand::ReopenWithEncoding(_)) => Some(doc.path().is_some()),
+                Command::App(AppCommand::EditDetail) => Some(doc.detail_view()),
                 _ => None,
             };
             unsafe {

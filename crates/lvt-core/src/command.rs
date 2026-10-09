@@ -96,6 +96,10 @@ pub enum AppCommand {
     VimSearch { forward: bool },
     /// Vim の `*` / `#`: キャレット位置の単語を検索する。
     SearchWord { forward: bool },
+    /// キャレット行の詳細 (`*[…]`) を編集ウィンドウで編集する (なければ作る)。
+    EditDetail,
+    /// .txt で詳細の折りたたみ表示を使うか切り替える (.lvt は常に使う)。
+    ToggleTxtDetailView,
 }
 
 impl From<EditCommand> for Command {

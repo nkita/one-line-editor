@@ -70,6 +70,8 @@ Document {
 | `set_selection(sel)` | 選択を変える。変わった場合は Undo の結合を解除する |
 | `undo()` / `redo()` | 戻り値は「実行したか」 |
 | `begin_undo_group()` / `end_undo_group()` | 間の変更を 1 回の Undo で戻せるようにする (`History` のまとめ) |
+| `set_detail_view(on)` / `detail_at_line(line)` | 行頭の詳細 (`*[…]`) の折りたたみ (§17)。有効なとき、`set_selection` / `apply` / `undo` / `redo` は、キャレットを詳細の内側に置かず、詳細に一部だけかかる編集を詳細全体に広げる |
+| `expand_range(r)` | 詳細に一部だけかかる範囲を詳細全体に広げる (Vim のヤンクする文字列を合わせるために使う) |
 | `caret_pos()` | キャレットを描く位置。通常は `selection.head`、Vim のビジュアルモードでは `visual.cursor` |
 | `is_modified()` | テキストの変更、または文字コード・改行コードの変更があるか |
 | `is_pristine()` | パスなし・未変更・空。ファイルを開いたときに、このタブを置き換えてよいかの判定に使う |
@@ -264,3 +266,16 @@ VimMode { state: Normal | Insert | Visual{linewise}, pending: Vec<Tok>, fallback
 | キー | 値 |
 |---|---|
 | `input_mode` | `"vim"` (既定。キーがないときも Vim) / `"standard"` |
+| `txt_detail_view` | `true` (既定) / `false`。.txt で詳細の折りたたみを使うか |
+
+## 17. detail.rs — 行頭の詳細 (`*[…]`)
+
+- **記法**: 行頭 (先頭の空白・タブは許可) の `*[` から、エスケープされていない最初の `]` まで。内容の中では `\n` が改行、`\]` が `]`、`\\` が `\` (`escape` / `unescape`)。閉じがなければ詳細ではない。1 行に高々 1 つ。
+- **`Token {start, end}`**: 行内の文字位置 (`*` の位置と `]` の直後)。`content()` は `[` と `]` の間。
+- **表示**: `view_text` で詳細を `ICON` (📝) 1 文字に置き換える。文書上の桁 ⇔ 表示上の桁は `to_view` / `to_doc` (詳細より後ろを `end - start - 1` ずらすだけ)。
+- **キャレットと編集の整合** (`Document` が行う):
+  - キャレット・選択の端は詳細の内側 (`start < 桁 < end`) に置かない。移動の向きに応じて前後の端へ寄せ、選択の起点は詳細全体を含む側へ寄せる。
+  - 詳細に一部だけかかる編集は詳細全体に広げ、キャレットは広げた範囲の先頭に置く (BS / Del / Vim の `x` などで詳細全体が消え、Undo で戻る)。
+  - 内容の中に収まる編集 (置換・編集ウィンドウからの書き戻し) はそのまま行う。記号の間 (`*` と `[` の間) への挿入は詳細の後ろへ移す。
+- **上下移動の桁**: 詳細のある行では、折りたたんだ表示で表示桁を数える (`editor::current_display_col` / `pos_at_display_col` の `detail_view` 引数)。
+- 有効・無効は UI 層が拡張子 (`.lvt` は常に、`.txt` は設定) で決める。

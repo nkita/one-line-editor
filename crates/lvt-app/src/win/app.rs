@@ -11,6 +11,7 @@ use lvt_core::editor::{self, EditorConfig, ViewInfo};
 use lvt_core::encoding::{SaveError, TextEncoding};
 use lvt_core::history::MergeKind;
 use lvt_core::keymap::{InputMode, Key, KeyChord, Keymap, ModeResponse, StandardMode};
+use lvt_core::detail::{self, Token};
 use lvt_core::link;
 use lvt_core::settings::Settings;
 use lvt_core::vim::{self, ex, Register, VimEdit, VimMode};
@@ -72,6 +73,8 @@ pub enum Deferred {
     OpenUrl(String),
     /// Vim の :q / :q! / :wq。最後のタブなら終了する。
     Quit { idx: usize, save: bool, force: bool },
+    /// 詳細 (`*[…]`) の編集ウィンドウを開く。
+    EditDetail { idx: usize, line: usize },
 }
 
 /// IME で変換中の文字列。本文のキャレット位置に埋め込んで描画する。
@@ -100,6 +103,17 @@ pub struct Geometry {
     pub status_top: f32,
     pub gutter_w: f32,
     pub text_left: f32,
+}
+
+/// `App::hit_view` の結果。
+struct ViewHit {
+    line: usize,
+    /// 表示用の行の文字位置。
+    vcol: usize,
+    text: String,
+    token: Option<Token>,
+    /// 詳細のアイコンの上か。
+    on_icon: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +169,10 @@ pub struct App {
     settings_path: Option<PathBuf>,
     /// 入力欄の処理 (`:w` など) から返す `Deferred`。
     pending_deferred: Option<Deferred>,
+    /// .txt で詳細の折りたたみ表示を使うか (.lvt は常に使う)。
+    pub txt_detail_view: bool,
+    /// 詳細パネルの領域 (left, top, right, bottom)。表示していなければ None (paint.rs が更新する)。
+    pub detail_panel: Option<(f32, f32, f32, f32)>,
 }
 
 /// Vim キーバインドを使うか。設定がなければ Vim を既定にする。
@@ -185,6 +203,7 @@ impl App {
         settings_path: Option<PathBuf>,
     ) -> Result<Self> {
         let vim_enabled = vim_by_default(&settings);
+        let txt_detail_view = settings.get("txt_detail_view") != Some("false");
         let editor_cfg = EditorConfig::default();
         let renderer = Renderer::new(hwnd, editor_cfg.tab_width)?;
         Ok(Self {
@@ -217,6 +236,8 @@ impl App {
             settings,
             settings_path,
             pending_deferred: None,
+            txt_detail_view,
+            detail_panel: None,
         })
     }
 
@@ -280,14 +301,88 @@ impl App {
         s.slice(..n).to_string()
     }
 
+    /// 表示用の行の文字列と、その行の詳細。詳細はアイコン 1 文字に折りたたむ。
+    pub fn view_line(doc: &Document, line: usize) -> (String, Option<Token>) {
+        let Some(t) = doc.detail_at_line(line) else { return (Self::line_text(doc, line), None) };
+        let s = doc.buffer().line(line);
+        let tail_end = s.len_chars().min(t.end + MAX_RENDER_CHARS);
+        let mut v = s.slice(..t.start).to_string();
+        v.push(detail::ICON);
+        v.push_str(&s.slice(t.end..tail_end).to_string());
+        (v, Some(t))
+    }
+
     /// 行内の文字位置の x 座標 (行頭からの DIP)。
     fn col_x(&self, line: usize, col: usize) -> f32 {
-        let text = Self::line_text(self.doc(), line);
+        let (text, token) = Self::view_line(self.doc(), line);
+        let vcol = token.map_or(col, |t| t.to_view(col, false));
         let u: Vec<u16> = text.encode_utf16().collect();
         match self.renderer.layout(&u, &self.renderer.text_format) {
-            Some(l) => Renderer::x_of(&l, char_to_utf16(&text, col)),
-            None => col as f32 * self.renderer.char_width,
+            Some(l) => Renderer::x_of(&l, char_to_utf16(&text, vcol)),
+            None => vcol as f32 * self.renderer.char_width,
         }
+    }
+
+    /// .txt / .lvt かどうか (と設定) で、各タブの詳細の折りたたみを有効・無効にする。
+    fn update_detail_views(&mut self) {
+        let txt = self.txt_detail_view;
+        for t in &mut self.tabs {
+            let ext = t.doc.path().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_ascii_lowercase());
+            let on = match ext.as_deref() {
+                Some("lvt") => true,
+                Some("txt") => txt,
+                _ => false,
+            };
+            if t.doc.detail_view() != on {
+                t.doc.set_detail_view(on);
+            }
+        }
+    }
+
+    /// 詳細の編集ウィンドウに渡す文字列 (行に詳細がなければ空)。
+    pub fn detail_text(&self, idx: usize, line: usize) -> Option<String> {
+        let doc = &self.tabs.get(idx)?.doc;
+        let Some(t) = doc.detail_at_line(line) else { return Some(String::new()) };
+        let ls = doc.buffer().line_to_char(line);
+        let c = t.content();
+        Some(detail::unescape(&doc.buffer().slice_to_string(ls + c.start..ls + c.end)))
+    }
+
+    /// 編集ウィンドウで確定した文字列を書き戻す (1 回の Undo で戻せる)。行に詳細がなければ行頭に作る。
+    pub fn write_detail(&mut self, idx: usize, line: usize, text: &str) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        let doc = &mut tab.doc;
+        if line >= doc.buffer().len_lines() {
+            return;
+        }
+        let escaped = detail::escape(text);
+        let ls = doc.buffer().line_to_char(line);
+        let n = escaped.chars().count();
+        match doc.detail_at_line(line) {
+            Some(t) => {
+                let c = t.content();
+                if doc.buffer().slice_to_string(ls + c.start..ls + c.end) == escaped {
+                    return;
+                }
+                let end = ls + c.start + n + 1;
+                doc.apply(vec![(ls + c.start..ls + c.end, escaped)], MergeKind::None, |_, _| Selection::caret(end));
+            }
+            None if text.is_empty() => return,
+            None => {
+                let line_text = doc.buffer().line(line);
+                let indent = line_text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+                let sep = if line_text.len_chars() > indent { " " } else { "" };
+                let at = ls + indent;
+                let end = at + n + 3;
+                doc.apply(vec![(at..at, format!("*[{escaped}]{sep}"))], MergeKind::None, |_, _| Selection::caret(end));
+            }
+        }
+        doc.end_undo_group();
+        if idx == self.active {
+            self.ensure_caret_visible();
+        }
+        self.status = Some("詳細を更新しました".into());
+        self.refresh();
     }
 
     // ---- 再描画・スクロール ----
@@ -576,6 +671,30 @@ impl App {
                 self.prompt = Some(Prompt::new(PromptKind::VimSearch { forward }, String::new(), origin));
             }
             A::SearchWord { forward } => self.search_word(forward),
+            A::EditDetail => {
+                if !self.doc().detail_view() {
+                    self.status = Some(if self.txt_detail_view {
+                        "詳細 (*[…]) は .txt / .lvt ファイルで使えます"
+                    } else {
+                        "詳細 (*[…]) は .lvt ファイルで使えます (.txt は表示メニューで有効にできます)"
+                    }
+                    .into());
+                    return None;
+                }
+                let line = self.doc().buffer().char_to_line(self.doc().caret_pos());
+                return Some(Deferred::EditDetail { idx: self.active, line });
+            }
+            A::ToggleTxtDetailView => {
+                self.txt_detail_view = !self.txt_detail_view;
+                self.update_detail_views();
+                self.settings.set("txt_detail_view", if self.txt_detail_view { "true" } else { "false" });
+                self.status = Some(format!(".txt の詳細ビュー: {}", if self.txt_detail_view { "オン" } else { "オフ" }));
+                if let Some(path) = &self.settings_path {
+                    if let Err(e) = self.settings.save(path) {
+                        self.status = Some(format!("設定を保存できませんでした: {e}"));
+                    }
+                }
+            }
             A::Cancel => {
                 if self.prompt.take().is_none() {
                     self.highlight_matches = false;
@@ -674,6 +793,7 @@ impl App {
                 Err(e) => errors.push(format!("{}\n{}", path.display(), e)),
             }
         }
+        self.update_detail_views();
         self.refresh();
         errors
     }
@@ -682,6 +802,7 @@ impl App {
         set_wait_cursor();
         let tab = self.tabs.get_mut(idx).ok_or_else(|| SaveError::Io(std::io::Error::other("tab not found")))?;
         tab.doc.save_as(path)?;
+        self.update_detail_views(); // 拡張子が変わった場合
         self.status = Some(format!("保存しました: {}", path.display()));
         self.refresh();
         Ok(())
@@ -709,6 +830,7 @@ impl App {
         let line = tab.scroll_line;
         *tab = Tab::new(doc);
         tab.scroll_line = line;
+        self.update_detail_views();
         self.status = Some(format!("{} で開き直しました", enc.name()));
         self.refresh();
         Ok(())
@@ -1132,16 +1254,29 @@ impl App {
 
     /// 画面座標 (DIP) → 文字位置。
     fn pos_at(&self, g: &Geometry, x: f32, y: f32) -> usize {
+        let hit = self.hit_view(g, x, y);
+        let col = hit.token.map_or(hit.vcol, |t| t.to_doc(hit.vcol));
+        self.doc().buffer().line_to_char(hit.line) + col
+    }
+
+    /// 画面座標 (DIP) にある、表示用の行の文字位置。
+    fn hit_view(&self, g: &Geometry, x: f32, y: f32) -> ViewHit {
         let line = self.line_at_y(g, y);
-        let doc = self.doc();
-        let text = Self::line_text(doc, line);
+        let (text, token) = Self::view_line(self.doc(), line);
         let u: Vec<u16> = text.encode_utf16().collect();
         let tx = (x - g.text_left + self.tab().scroll_x).max(0.0);
-        let col = match self.renderer.layout(&u, &self.renderer.text_format) {
-            Some(l) => utf16_to_char(&text, Renderer::pos_at(&l, tx)),
-            None => 0,
+        let (vcol, icon) = match self.renderer.layout(&u, &self.renderer.text_format) {
+            Some(l) => {
+                let icon = token.map(|t| {
+                    let p = char_to_utf16(&text, t.start);
+                    (Renderer::x_of(&l, p), Renderer::x_of(&l, p + detail::ICON.len_utf16()))
+                });
+                let on_icon = icon.is_some_and(|(x0, x1)| tx >= x0 && tx < x1);
+                (utf16_to_char(&text, Renderer::pos_at(&l, tx)), on_icon)
+            }
+            None => (0, false),
         };
-        doc.buffer().line_to_char(line) + col
+        ViewHit { line, vcol, text, token, on_icon: icon }
     }
 
     /// 画面座標 (DIP) にある URL (Ctrl+クリックで開く対象)。
@@ -1149,13 +1284,9 @@ impl App {
         if y < g.text_top || y >= g.text_bottom || x < g.text_left {
             return None;
         }
-        let pos = self.pos_at(g, x, y);
-        let buf = self.doc().buffer();
-        let line = buf.char_to_line(pos);
-        let col = pos - buf.line_to_char(line);
-        let text = Self::line_text(self.doc(), line);
-        let byte = text.char_indices().nth(col).map(|(b, _)| b)?;
-        link::url_at(&text, byte).map(|r| link::normalize(&text[r]))
+        let hit = self.hit_view(g, x, y);
+        let byte = hit.text.char_indices().nth(hit.vcol).map(|(b, _)| b)?;
+        link::url_at(&hit.text, byte).map(|r| link::normalize(&hit.text[r]))
     }
 
     fn select_lines(&mut self, a: usize, b: usize) {
@@ -1176,6 +1307,16 @@ impl App {
         }
         if y < g.text_top || y >= g.text_bottom {
             return None;
+        }
+        if self.in_detail_panel(x, y) {
+            let line = self.doc().buffer().char_to_line(self.doc().caret_pos());
+            return Some(Deferred::EditDetail { idx: self.active, line });
+        }
+        if double && x >= g.text_left {
+            let hit = self.hit_view(&g, x, y);
+            if hit.on_icon {
+                return Some(Deferred::EditDetail { idx: self.active, line: hit.line });
+            }
         }
         let mods = input::current_modifiers();
         if mods.ctrl && !mods.shift && !double {
@@ -1413,7 +1554,9 @@ impl App {
         let (x, y) = self.mouse;
         let id = if y < g.text_top || y >= g.text_bottom || x < g.gutter_w {
             IDC_ARROW
-        } else if input::current_modifiers().ctrl && self.drag.is_none() && self.url_at(&g, x, y).is_some() {
+        } else if self.in_detail_panel(x, y)
+            || (input::current_modifiers().ctrl && self.drag.is_none() && self.url_at(&g, x, y).is_some())
+        {
             IDC_HAND
         } else {
             IDC_IBEAM
@@ -1423,6 +1566,10 @@ impl App {
                 SetCursor(Some(c));
             }
         }
+    }
+
+    fn in_detail_panel(&self, x: f32, y: f32) -> bool {
+        self.detail_panel.is_some_and(|(l, t, r, b)| x >= l && x < r && y >= t && y < b)
     }
 
     /// マウスがウィンドウ上にあれば、現在のマウス位置でカーソルの形を更新する。
@@ -1438,7 +1585,7 @@ impl App {
     }
 
     pub fn update_menu(&self) {
-        self.menus.update(self.doc(), self.theme.name == "dark", self.vim_enabled);
+        self.menus.update(self.doc(), self.theme.name == "dark", self.vim_enabled, self.txt_detail_view);
     }
 
     // ---- IME ----

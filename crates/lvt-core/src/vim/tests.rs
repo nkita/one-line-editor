@@ -226,3 +226,19 @@ fn standard_keys_in_normal_mode() {
     let resp = h.mode.on_key(KeyChord::parse("Ctrl+S").unwrap());
     assert!(matches!(resp, ModeResponse::Commands(c) if c == vec![Command::App(AppCommand::Save)]));
 }
+
+#[test]
+fn detail_tokens() {
+    let mut h = Harness::new("*[a\\nb] title\nnext", 0);
+    h.doc.set_detail_view(true);
+    h.keys("l").check("*[a\\nb] title\nnext", 7);
+    h.keys("h").check("*[a\\nb] title\nnext", 0);
+    h.keys("x").check(" title\nnext", 0);
+    assert_eq!(h.clip.as_ref().unwrap().text, "*[a\\nb]"); // 詳細全体をヤンクする
+    h.keys("P").check("*[a\\nb] title\nnext", 0); // 貼り付け後のキャレットが詳細の内側なら先頭へ
+    h.keys("u").check(" title\nnext", 0);
+    let mut h = Harness::new("*[abc]", 6);
+    h.doc.set_detail_view(true);
+    h.keys("<Esc>").check("*[abc]", 0); // 行末の 1 つ手前は詳細の内側なので先頭へ
+    h.keys("jdd").check("", 0);
+}

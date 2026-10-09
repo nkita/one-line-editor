@@ -7,6 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::buffer::TextBuffer;
+use crate::detail::{self, Token};
 use crate::encoding::{self, DecodedText, LineEnding, SaveError, TextEncoding};
 use crate::history::{Edit, History, MergeKind};
 use crate::selection::Selection;
@@ -20,6 +21,8 @@ pub struct Document {
     pub preferred_col: Option<usize>,
     /// Vim のビジュアルモードの状態 (選択範囲は `vim` モジュールがこれから作る)。
     pub visual: Option<Visual>,
+    /// 行頭の詳細 (`*[…]`) を折りたたむか (.txt / .lvt で UI 層が有効にする)。
+    detail_view: bool,
     history: History,
     path: Option<PathBuf>,
     pub encoding: TextEncoding,
@@ -45,6 +48,7 @@ impl Document {
             selection: Selection::default(),
             preferred_col: None,
             visual: None,
+            detail_view: false,
             history: History::new(),
             path: None,
             encoding: TextEncoding::Utf8,
@@ -157,10 +161,91 @@ impl Document {
         self.highlighter.highlight_line(text, state, out);
     }
 
+    // ---- 詳細 (`*[…]`) の折りたたみ ----
+
+    pub fn detail_view(&self) -> bool {
+        self.detail_view
+    }
+
+    /// 詳細の折りたたみを有効・無効にする。有効にしたら、キャレットを詳細の外へ寄せる。
+    pub fn set_detail_view(&mut self, on: bool) {
+        self.detail_view = on;
+        let sel = self.selection;
+        self.selection = self.snap_selection(sel, sel);
+    }
+
+    /// 行の詳細 (折りたたみが無効なら None)。
+    pub fn detail_at_line(&self, line: usize) -> Option<Token> {
+        if self.detail_view {
+            detail::find_in_line(&self.buffer, line)
+        } else {
+            None
+        }
+    }
+
+    /// `pos` が詳細の内側なら、`forward` に応じて後ろ・前の端へ寄せる。
+    fn snap(&self, pos: usize, forward: bool) -> usize {
+        if !self.detail_view {
+            return pos;
+        }
+        let line = self.buffer.char_to_line(pos);
+        let ls = self.buffer.line_to_char(line);
+        match self.detail_at_line(line) {
+            Some(t) if t.contains_inner(pos - ls) => ls + if forward { t.end } else { t.start },
+            _ => pos,
+        }
+    }
+
+    /// 新しい選択の端が詳細の内側に入らないようにする。キャレットは移動の向きに、
+    /// 選択の起点は詳細全体を含む向きに寄せる。
+    fn snap_selection(&self, old: Selection, new: Selection) -> Selection {
+        if !self.detail_view {
+            return new;
+        }
+        let head = self.snap(new.head, new.head > old.head);
+        let anchor = if new.anchor == new.head { head } else { self.snap(new.anchor, new.anchor > head) };
+        Selection::new(anchor, head)
+    }
+
+    /// 詳細に一部だけかかる範囲を、詳細全体に広げる (詳細を壊さないように)。
+    /// 詳細の内容の中に収まる範囲 (置換など) と、詳細にかからない範囲はそのまま。
+    pub fn expand_range(&self, r: Range<usize>) -> Range<usize> {
+        if !self.detail_view {
+            return r;
+        }
+        let buf = &self.buffer;
+        let token_of = |p: usize| {
+            let line = buf.char_to_line(p);
+            let ls = buf.line_to_char(line);
+            detail::find_in_line(buf, line).map(|t| (ls, t))
+        };
+        let (mut s, mut e) = (r.start, r.end);
+        if let Some((ls, t)) = token_of(s) {
+            let c = t.content();
+            if ls + c.start <= s && e <= ls + c.end {
+                return r;
+            }
+            if t.contains_inner(s - ls) {
+                if s == e {
+                    // 詳細の記号の間への挿入は、詳細の後ろへ
+                    return ls + t.end..ls + t.end;
+                }
+                s = ls + t.start;
+            }
+        }
+        if let Some((ls, t)) = token_of(e) {
+            if t.contains_inner(e - ls) {
+                e = ls + t.end;
+            }
+        }
+        s..e
+    }
+
     // ---- 変更系 ----
 
     pub fn set_selection(&mut self, sel: Selection) {
         let sel = sel.clamp(self.buffer.len_chars());
+        let sel = self.snap_selection(self.selection, sel);
         if sel != self.selection {
             self.history.break_merge();
         }
@@ -192,6 +277,29 @@ impl Document {
         if edits.is_empty() {
             return;
         }
+        // 詳細を壊す編集は詳細全体に広げ、キャレットは広げた範囲の先頭に置く
+        let mut expanded_at = None;
+        if self.detail_view {
+            for e in &mut edits {
+                let r = self.expand_range(e.0.clone());
+                if r != e.0 {
+                    expanded_at = Some(expanded_at.map_or(r.start, |p: usize| p.min(r.start)));
+                    e.0 = r;
+                }
+            }
+            if expanded_at.is_some() {
+                edits.sort_by_key(|e| e.0.start);
+                edits.dedup_by(|later, earlier| later.0.start < earlier.0.end);
+            }
+        }
+        let caret_after_expand = expanded_at.map(|p| {
+            let delta: isize = edits
+                .iter()
+                .filter(|e| e.0.end <= p && e.0.start < p)
+                .map(|e| e.1.chars().count() as isize - e.0.len() as isize)
+                .sum();
+            (p as isize + delta) as usize
+        });
         // 後ろから適用すれば前方の位置がずれない
         edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
         let before = self.selection;
@@ -199,7 +307,12 @@ impl Document {
         for (range, text) in edits {
             records.push(self.raw_replace(range.start, range.end - range.start, &text));
         }
-        let sel = after(&self.buffer, &records).clamp(self.buffer.len_chars());
+        let sel = match caret_after_expand {
+            Some(p) => Selection::caret(p),
+            None => after(&self.buffer, &records),
+        };
+        let sel = sel.clamp(self.buffer.len_chars());
+        let sel = self.snap_selection(sel, sel);
         self.selection = sel;
         self.history.record(records, before, sel, merge);
     }
@@ -227,7 +340,8 @@ impl Document {
             let n = e.inserted.chars().count();
             self.raw_replace(e.pos, n, &e.deleted);
         }
-        self.selection = tx.before.clamp(self.buffer.len_chars());
+        let sel = tx.before.clamp(self.buffer.len_chars());
+        self.selection = self.snap_selection(sel, sel);
         self.preferred_col = None;
         self.history.push_redo(tx);
         true
@@ -239,7 +353,8 @@ impl Document {
             let n = e.deleted.chars().count();
             self.raw_replace(e.pos, n, &e.inserted);
         }
-        self.selection = tx.after.clamp(self.buffer.len_chars());
+        let sel = tx.after.clamp(self.buffer.len_chars());
+        self.selection = self.snap_selection(sel, sel);
         self.preferred_col = None;
         self.history.push_undo(tx);
         true

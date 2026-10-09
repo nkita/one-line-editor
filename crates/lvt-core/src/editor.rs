@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use crate::buffer::TextBuffer;
 use crate::command::{EditCommand, Motion};
+use crate::detail;
 use crate::document::Document;
 use crate::history::MergeKind;
 use crate::selection::Selection;
@@ -82,7 +83,8 @@ fn move_caret(doc: &mut Document, motion: Motion, extend: bool, cfg: &EditorConf
     let pos = sel.head;
     let (line, _) = buf.line_col(pos);
     let vertical = matches!(motion, Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown);
-    let pref = doc.preferred_col.unwrap_or_else(|| current_display_col(buf, pos, cfg.tab_width));
+    let dv = doc.detail_view();
+    let pref = doc.preferred_col.unwrap_or_else(|| current_display_col(buf, pos, cfg.tab_width, dv));
 
     let target = match motion {
         // 選択中に Shift なしの左右キーを押したら選択の端へ縮める
@@ -102,25 +104,47 @@ fn move_caret(doc: &mut Document, motion: Motion, extend: bool, cfg: &EditorConf
         Motion::DocEnd => buf.len_chars(),
         Motion::Up if line == 0 => 0,
         Motion::Down if line + 1 >= buf.len_lines() => buf.len_chars(),
-        Motion::Up => pos_at_display_col(buf, line - 1, pref, cfg.tab_width),
-        Motion::Down => pos_at_display_col(buf, line + 1, pref, cfg.tab_width),
-        Motion::PageUp => pos_at_display_col(buf, line.saturating_sub(view.page_lines.max(1)), pref, cfg.tab_width),
+        Motion::Up => pos_at_display_col(buf, line - 1, pref, cfg.tab_width, dv),
+        Motion::Down => pos_at_display_col(buf, line + 1, pref, cfg.tab_width, dv),
+        Motion::PageUp => pos_at_display_col(buf, line.saturating_sub(view.page_lines.max(1)), pref, cfg.tab_width, dv),
         Motion::PageDown => {
             let l = (line + view.page_lines.max(1)).min(buf.len_lines() - 1);
-            pos_at_display_col(buf, l, pref, cfg.tab_width)
+            pos_at_display_col(buf, l, pref, cfg.tab_width, dv)
         }
     };
     doc.set_selection(sel.moved_to(target, extend));
     doc.preferred_col = vertical.then_some(pref);
 }
 
-pub(crate) fn current_display_col(buf: &TextBuffer, pos: usize, tab: usize) -> usize {
+pub(crate) fn current_display_col(buf: &TextBuffer, pos: usize, tab: usize, detail_view: bool) -> usize {
     let (line, col) = buf.line_col(pos);
-    width::display_col(buf.line(line).chars(), col, tab)
+    match detail_token(buf, line, detail_view) {
+        Some(t) => {
+            let view = detail::view_text(&buf.line(line).to_string(), Some(t));
+            width::display_col(view.chars(), t.to_view(col, false), tab)
+        }
+        None => width::display_col(buf.line(line).chars(), col, tab),
+    }
 }
 
-pub(crate) fn pos_at_display_col(buf: &TextBuffer, line: usize, col: usize, tab: usize) -> usize {
-    buf.line_to_char(line) + width::char_col_at_display(buf.line(line).chars(), col, tab)
+/// 行の表示桁 `col` に最も近い文字位置。詳細を折りたたんでいる行では、折りたたんだ表示で数える。
+pub(crate) fn pos_at_display_col(buf: &TextBuffer, line: usize, col: usize, tab: usize, detail_view: bool) -> usize {
+    let start = buf.line_to_char(line);
+    match detail_token(buf, line, detail_view) {
+        Some(t) => {
+            let view = detail::view_text(&buf.line(line).to_string(), Some(t));
+            start + t.to_doc(width::char_col_at_display(view.chars(), col, tab))
+        }
+        None => start + width::char_col_at_display(buf.line(line).chars(), col, tab),
+    }
+}
+
+fn detail_token(buf: &TextBuffer, line: usize, detail_view: bool) -> Option<detail::Token> {
+    if detail_view {
+        detail::find_in_line(buf, line)
+    } else {
+        None
+    }
 }
 
 /// 単語の先頭方向への移動先。空白を飛ばし、同じ文字種が続く範囲を 1 単語とみなす。
@@ -212,7 +236,7 @@ fn insert_tab(doc: &mut Document, cfg: &EditorConfig) {
     let buf = doc.buffer();
     let lines = selected_lines(buf, sel);
     if sel.is_empty() || lines.len() == 1 {
-        let unit = indent_unit(cfg, current_display_col(buf, sel.start(), cfg.tab_width));
+        let unit = indent_unit(cfg, current_display_col(buf, sel.start(), cfg.tab_width, doc.detail_view()));
         doc.replace_selection(&unit, MergeKind::None);
         return;
     }
@@ -389,5 +413,79 @@ mod tests {
         assert_eq!(d.buffer().to_string(), "hello\nhello");
         run(&mut d, &[EditCommand::SelectAll, EditCommand::DeleteForward]);
         assert_eq!(d.buffer().to_string(), "");
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    const VIEW: ViewInfo = ViewInfo { page_lines: 10, top_line: 0 };
+
+    fn doc(text: &str, caret: usize) -> Document {
+        let mut d = Document::from_text(text);
+        d.set_detail_view(true);
+        d.set_selection(Selection::caret(caret));
+        d
+    }
+
+    fn run(d: &mut Document, cmds: &[EditCommand]) {
+        for c in cmds {
+            execute(d, c, &EditorConfig::default(), &VIEW);
+        }
+    }
+
+    fn mv(motion: Motion) -> EditCommand {
+        EditCommand::Move { motion, extend: false }
+    }
+
+    #[test]
+    fn caret_skips_detail() {
+        let mut d = doc("*[abc] x", 0);
+        run(&mut d, &[mv(Motion::Right)]);
+        assert_eq!(d.selection().head, 6);
+        run(&mut d, &[mv(Motion::Right), mv(Motion::Left), mv(Motion::Left)]);
+        assert_eq!(d.selection().head, 0);
+        d.set_selection(Selection::caret(3)); // 内側へは置けない (前向きの移動なので後ろの端へ)
+        assert_eq!(d.selection().head, 6);
+        d.set_selection(Selection::caret(0));
+        run(&mut d, &[EditCommand::Move { motion: Motion::Right, extend: true }]);
+        assert_eq!(d.selected_text(), "*[abc]");
+    }
+
+    #[test]
+    fn deleting_part_removes_whole_detail() {
+        let mut d = doc("  *[abc] x", 8);
+        run(&mut d, &[EditCommand::DeleteBackward]);
+        assert_eq!((d.buffer().to_string().as_str(), d.selection().head), ("   x", 2));
+        run(&mut d, &[EditCommand::Undo]);
+        assert_eq!(d.buffer().to_string(), "  *[abc] x");
+        d.set_selection(Selection::caret(2));
+        run(&mut d, &[EditCommand::DeleteForward]);
+        assert_eq!(d.buffer().to_string(), "   x");
+    }
+
+    #[test]
+    fn content_edits_and_insertions() {
+        let mut d = doc("*[abc] x", 0);
+        d.apply(vec![(2..5, "zz".into())], MergeKind::None, |_, _| Selection::caret(0));
+        assert_eq!(d.buffer().to_string(), "*[zz] x");
+        // 記号の間への挿入は詳細の後ろへ
+        d.apply(vec![(1..1, "Q".into())], MergeKind::None, |_, _| Selection::caret(0));
+        assert_eq!(d.buffer().to_string(), "*[zz]Q x");
+        // 折りたたみが無効なら通常の文字列
+        d.set_detail_view(false);
+        d.set_selection(Selection::caret(3));
+        assert_eq!(d.selection().head, 3);
+    }
+
+    #[test]
+    fn vertical_move_uses_folded_columns() {
+        // 表示は "📝xy" (アイコンは 2 桁)
+        let mut d = doc("*[abc]xy\nabcdef", 7);
+        run(&mut d, &[mv(Motion::Down)]);
+        assert_eq!(d.selection().head, 12);
+        run(&mut d, &[mv(Motion::Up)]);
+        assert_eq!(d.selection().head, 7);
     }
 }

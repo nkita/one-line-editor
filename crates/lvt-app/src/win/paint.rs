@@ -1,13 +1,14 @@
 //! 画面の描画 (WM_PAINT)。見えている行だけを 1 行ずつレイアウトして描く。
 
 use lvt_core::keymap::CaretStyle;
+use lvt_core::detail;
 use lvt_core::link;
 use lvt_core::syntax::{StyleSpan, TokenKind};
 use lvt_core::theme::Theme;
 use regex::Regex;
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextLayout, DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_WEIGHT_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_RANGE,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_WRAP,
 };
 
 use super::app::{prompt_input_left, status_prompt_text_left, App, Geometry, ImeComposition, Tab, TabHit};
@@ -38,6 +39,7 @@ impl App {
         };
         let tab = &mut self.tabs[self.active];
         paint_text(&mut self.renderer, tab, &g, &theme, &ctx);
+        self.paint_detail_panel(&g, &theme);
 
         self.paint_tabbar(&g, &theme);
         if self.prompt.as_ref().is_some_and(|p| !p.in_status_bar()) {
@@ -45,6 +47,63 @@ impl App {
         }
         self.paint_status(&g, &theme);
         self.renderer.end();
+    }
+
+    /// キャレット行の詳細 (`*[…]`) の内容を、本文の右上 (キャレット行と重なるなら右下) に表示する。
+    fn paint_detail_panel(&mut self, g: &Geometry, theme: &Theme) {
+        self.detail_panel = None;
+        let doc = &self.tabs[self.active].doc;
+        let caret_line = doc.buffer().char_to_line(doc.caret_pos());
+        let Some(token) = doc.detail_at_line(caret_line) else { return };
+        let ls = doc.buffer().line_to_char(caret_line);
+        let c = token.content();
+        let content = detail::unescape(&doc.buffer().slice_to_string(ls + c.start..ls + c.end));
+        let scroll_line = self.tabs[self.active].scroll_line;
+
+        let r = &mut self.renderer;
+        let text_w = g.width - g.text_left;
+        let text_h = g.text_bottom - g.text_top;
+        if text_w < 260.0 || text_h < 120.0 {
+            return;
+        }
+        let pad = 10.0;
+        let w = (text_w * 0.4).clamp(240.0, 520.0);
+        let inner_w = w - pad * 2.0;
+        let header_h = r.ui_line_height + 6.0;
+        let empty = content.is_empty();
+        let shown = if empty { "(空です。F2 で編集)".to_string() } else { content };
+        let Some(layout) = r.layout_str(&shown, &r.text_format.clone()) else { return };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            let _ = layout.SetMaxWidth(inner_w);
+            let _ = layout.GetMetrics(&mut m);
+        }
+        let max_body = (text_h * 0.5 - header_h - pad * 2.0).max(r.line_height);
+        let body_h = m.height.min(max_body);
+        let h = pad + header_h + body_h + pad;
+        let x = g.width - w - 12.0;
+        // キャレット行と重なるなら下へ寄せる
+        let caret_y = g.text_top + (caret_line as f32 - scroll_line as f32) * r.line_height;
+        let mut y = g.text_top + 8.0;
+        if caret_y < y + h && caret_y + r.line_height > y {
+            y = g.text_bottom - h - 8.0;
+        }
+
+        r.fill(x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0, theme.accent);
+        r.fill(x, y, x + w, y + h, theme.chrome_bg);
+        let title = format!("{} 詳細  (F2 / クリックで編集)", detail::ICON);
+        r.push_clip(x, y, x + w, y + h);
+        r.draw_ui_text(&title, x + pad, y + pad * 0.5, header_h, theme.gutter_fg);
+        let body_top = y + pad + header_h;
+        r.push_clip(x + pad, body_top, x + w - pad, body_top + body_h);
+        r.draw_layout(&layout, x + pad, body_top, if empty { theme.gutter_fg } else { theme.foreground });
+        r.pop_clip();
+        if m.height > body_h {
+            r.draw_ui_text("…", x + w - pad - 12.0, y + h - pad - r.ui_line_height, r.ui_line_height, theme.gutter_fg);
+        }
+        r.pop_clip();
+        self.detail_panel = Some((x, y, x + w, y + h));
     }
 
     fn paint_tabbar(&mut self, g: &Geometry, theme: &Theme) {
@@ -185,16 +244,20 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         let y = g.text_top + i as f32 * lh;
         let line_start = tab.doc.buffer().line_to_char(line);
         let line_len = tab.doc.buffer().line_len(line);
-        let text = App::line_text(&tab.doc, line);
+        // 表示用の行 (行頭の詳細 `*[…]` はアイコン 1 文字に折りたたむ)。
+        // 文書上の桁 → 表示上の桁は `vcol` で変換する。
+        let (text, token) = App::view_line(&tab.doc, line);
+        let vcol = |col: usize| token.map_or(col, |t| t.to_view(col, false));
+        let caret_vcol = vcol(caret_col);
         // IME で変換中の文字列はキャレット位置に埋め込んで描く。
-        // 文書上の位置 (UTF-16) → 表示上の位置は `to_view` で変換する。
+        // 表示用の行の位置 (UTF-16) → 変換中の文字列を含めた位置は `to_view` で変換する。
         let ime = ctx.ime.filter(|_| line == caret_line);
-        let ime_at = char_to_utf16(&text, caret_col);
+        let ime_at = char_to_utf16(&text, caret_vcol);
         let ime_len = ime.map_or(0, |c| c.text.encode_utf16().count());
         let to_view = |p16: usize| if p16 >= ime_at { p16 + ime_len } else { p16 };
         let view_text = match ime {
             Some(c) => {
-                let at = text.char_indices().nth(caret_col).map_or(text.len(), |(b, _)| b);
+                let at = text.char_indices().nth(caret_vcol).map_or(text.len(), |(b, _)| b);
                 format!("{}{}{}", &text[..at], c.text, &text[at..])
             }
             None => text.clone(),
@@ -217,7 +280,7 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
             }
         }
         tab.max_width = tab.max_width.max(Renderer::layout_width(&layout));
-        let x_at = |col: usize| origin_x + Renderer::x_of(&layout, to_view(char_to_utf16(&text, col)));
+        let x_at = |col: usize| origin_x + Renderer::x_of(&layout, to_view(char_to_utf16(&text, vcol(col))));
 
         if line == caret_line && sel.is_empty() {
             r.fill(g.gutter_w, y, g.width, y + lh, theme.current_line);
@@ -248,7 +311,11 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
             let x1 = origin_x + Renderer::x_of(&layout, ime_at + t.end);
             r.fill(x0, y, x1, y + lh, theme.selection);
         } else if line == caret_line && ctx.focused && ctx.caret == CaretStyle::Block {
-            r.fill(caret_x, y, caret_x + cw, y + lh, theme.selection);
+            // ブロックキャレットは、キャレット位置の文字 (全角・アイコン) の幅に合わせる
+            let p16 = char_to_utf16(&text, caret_vcol);
+            let next = text.chars().nth(caret_vcol).map_or(p16, |c| p16 + c.len_utf16());
+            let w = (Renderer::x_of(&layout, next) - Renderer::x_of(&layout, p16)).max(cw);
+            r.fill(caret_x, y, caret_x + w, y + lh, theme.selection);
         }
 
         r.draw_layout(&layout, origin_x, y, theme.foreground);

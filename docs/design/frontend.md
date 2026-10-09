@@ -15,6 +15,7 @@ Win32 API と Direct2D/DirectWrite で書かれた UI 層です。`windows` crat
 | `win/prompt.rs` | `Prompt`: 下部の 1 行入力欄の状態 (種類・テキスト・キャレット) |
 | `win/dialogs.rs` | ファイルを開く/保存ダイアログ、メッセージボックス、クリップボード (CRLF ⇔ LF の変換) |
 | `win/input.rs` | 仮想キーコード → `Key`、修飾キーの状態 |
+| `win/detail_editor.rs` | 詳細 (`*[…]`) の編集ウィンドウ (モーダル。標準の EDIT コントロール) |
 | `win/util.rs` | UTF-16 変換 (文字・バイト ⇔ UTF-16 位置)、lParam/wParam の分解 |
 | `build.rs` + `res/` | アプリケーション マニフェスト (`res/lvt.manifest`) を exe に埋め込む。コモンコントロール v6 を指定し、ダイアログ・メッセージボックスを現行の Windows の見た目にする。GNU では `x86_64-w64-mingw32-windres` でリソースを作ってリンクし、MSVC ではリンカーの `/MANIFESTINPUT` を使う |
 
@@ -32,7 +33,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R>   // try_borrow_mut �
 
 ```rust
 enum Deferred { Open, OpenPaths(Vec<PathBuf>), Save(usize), SaveAs(usize), CloseTab(usize), Exit, Reopen(TextEncoding),
-                OpenUrl(String), Quit { idx, save, force } }   // Quit は Vim の :q / :q! / :wq (最後のタブなら終了)
+                OpenUrl(String), Quit { idx, save, force }, EditDetail { idx, line } }   // Quit は Vim の :q / :q! / :wq (最後のタブなら終了)
 ```
 
 ## 3. メッセージ処理
@@ -166,3 +167,10 @@ IMM32 を使います。
 - 状態は `%APPDATA%\lvt\settings.toml` の `input_mode` に保存し、起動時に読む (`lvt_core::settings`)。設定がなければ Vim を既定にする (`app::vim_by_default`)。保存に失敗したらステータスバーに表示する。
 - タブを切り替えたら、元のタブの Undo のまとめとビジュアルモードを終え、`InputMode::reset` で入力途中の状態を破棄する。
 - ヤンク・削除した文字列 (`editor::execute` の戻り値) はクリップボードに置き、`App.register` に覚える (`p` で行単位かどうかを判断するため)。
+
+## 14. 詳細 (`*[…]`) の表示と編集
+
+- **有効化**: `App::update_detail_views` が、拡張子 (`.lvt` は常に、`.txt` は `App.txt_detail_view`) で各タブの `Document::set_detail_view` を切り替える。ファイルを開いたとき・保存したとき (拡張子が変わりうる)・開き直したとき・メニューで切り替えたときに呼ぶ。設定は `settings.toml` の `txt_detail_view`。
+- **表示と座標**: `App::view_line(doc, line)` が表示用の行 (詳細をアイコンに置き換えたもの) と `Token` を返す。描画 (`paint_text`)・クリック判定 (`hit_view` → `pos_at` / `url_at`)・キャレットの x 座標 (`col_x`、IME の位置) はすべてこれを使い、桁は `Token::to_view` / `to_doc` で変換する。ブロックキャレットはキャレット位置の文字の幅 (アイコン・全角) に合わせる。
+- **パネル** (`paint_detail_panel`): キャレット行に詳細があれば、本文の右上に内容を折り返して表示する (幅は本文の 40%、240〜520 DIP。高さは本文の半分まで、はみ出したら「…」)。キャレット行と重なる場合は右下に置く。領域は `App.detail_panel` に記録し、クリック判定とカーソルの形に使う。
+- **編集**: `F2` (`AppCommand::EditDetail`)、アイコンのダブルクリック、パネルのクリックで `Deferred::EditDetail {idx, line}` → `detail_editor::edit` (モーダル。Ctrl+Enter で確定、Esc でキャンセル) → `App::write_detail` で内容をエスケープして書き戻す (1 回の Undo)。行に詳細がなければ、行頭 (インデントの後ろ) に `*[…] ` を作る。

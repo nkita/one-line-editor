@@ -11,6 +11,7 @@
 
 pub mod buffer;
 pub mod command;
+pub mod detail;
 pub mod document;
 pub mod editor;
 pub mod encoding;

@@ -203,6 +203,7 @@ impl Keymap {
         m.bind("Ctrl+0", A::ZoomReset);
         m.bind("Escape", A::Cancel);
         m.bind("Ctrl+Alt+V", A::ToggleVim);
+        m.bind("F2", A::EditDetail);
         m
     }
 }
