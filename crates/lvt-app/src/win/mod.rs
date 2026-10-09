@@ -8,6 +8,7 @@ mod paint;
 mod panel;
 mod prompt;
 mod render;
+mod scrollbar;
 mod util;
 
 use std::cell::RefCell;
@@ -19,6 +20,7 @@ use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
@@ -80,7 +82,7 @@ fn start() -> Result<()> {
             WINDOW_EX_STYLE::default(),
             class,
             w!("lvt"),
-            WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL,
+            WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -195,8 +197,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             with_app(|a| a.on_wheel(wheel_delta(wp), msg == WM_MOUSEHWHEEL));
             true
         }
-        WM_VSCROLL | WM_HSCROLL => {
-            with_app(|a| a.on_scroll(msg == WM_VSCROLL, loword(wp.0)));
+        WM_MOUSELEAVE => {
+            with_app(|a| a.on_mouse_leave());
             true
         }
         WM_SETCURSOR if loword(lp.0 as usize) as u32 == HTCLIENT => {

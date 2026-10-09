@@ -86,9 +86,9 @@ impl App {
 
     /// 編集中のパネルの大きさ。
     fn edit_panel_size(&self, g: &Geometry) -> (f32, f32) {
-        let area_w = g.width - g.gutter_w - PANEL_MARGIN * 2.0;
+        let area_w = g.text_right - g.gutter_w - PANEL_MARGIN * 2.0;
         let area_h = g.text_bottom - g.text_top - PANEL_MARGIN * 2.0;
-        let w = ((g.width - g.gutter_w) * 0.55).clamp(320.0, 760.0).min(area_w).max(120.0);
+        let w = ((g.text_right - g.gutter_w) * 0.55).clamp(320.0, 760.0).min(area_w).max(120.0);
         let h = ((g.text_bottom - g.text_top) * 0.6).clamp(200.0, 560.0).min(area_h).max(80.0);
         (w, h)
     }
@@ -96,7 +96,7 @@ impl App {
     /// パネルの位置。`avoid` (キャレット行の上下端) と重なる場合は、位置を動かしていなければ下へ寄せる。
     pub fn panel_rect(&self, g: &Geometry, w: f32, h: f32, avoid: Option<(f32, f32)>) -> PanelRect {
         let x0 = g.gutter_w + PANEL_MARGIN;
-        let x1 = (g.width - w - PANEL_MARGIN).max(x0);
+        let x1 = (g.text_right - w - PANEL_MARGIN).max(x0);
         let y0 = g.text_top + PANEL_MARGIN;
         let y1 = (g.text_bottom - h - PANEL_MARGIN).max(y0);
         let (fx, fy) = self.panel_pos.unwrap_or((1.0, 0.0));
@@ -120,8 +120,8 @@ impl App {
     pub fn edit_geometry(&self, g: Geometry) -> Geometry {
         let p = self.edit_panel_rect(&g);
         Geometry {
-            width: p.right - 14.0, // 右端はスクロールバー
-            gutter_w: p.left + 1.0,
+            text_right: p.right - 14.0, // 右端はスクロールバー
+            gutter_w: p.left + 6.0, // 現在行の帯が左の枠線に重ならないよう内側から始める
             text_left: p.left + 14.0,
             text_top: p.header_bottom + 6.0,
             text_bottom: p.bottom - 10.0,
@@ -135,7 +135,7 @@ impl App {
         let Some(p) = self.detail_panel else { return };
         let (w, h) = (p.right - p.left, p.bottom - p.top);
         let x0 = g.gutter_w + PANEL_MARGIN;
-        let x1 = g.width - w - PANEL_MARGIN;
+        let x1 = g.text_right - w - PANEL_MARGIN;
         let y0 = g.text_top + PANEL_MARGIN;
         let y1 = g.text_bottom - h - PANEL_MARGIN;
         let frac = |v: f32, a: f32, b: f32| if b > a { ((v - a) / (b - a)).clamp(0.0, 1.0) } else { 0.0 };

@@ -29,7 +29,8 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R>   // try_borrow_mut �
 - wndproc では、メッセージごとに `with_app` で `App` を借用して処理します。
 - **モーダルダイアログ (`GetOpenFileNameW`、`MessageBoxW` など) は、`App` を借用したまま呼んではいけません。** モーダルは内部でメッセージループを回すので、wndproc が再入して二重借用になります。
   → `App` のメソッドは、モーダルが必要な処理を **`Deferred`** として返します。wndproc は借用を解いてから `run_deferred` を実行します。`run_deferred` の中では、必要なときだけ短く `with_app` を呼びます。
-- `SetWindowTextW` や `SetScrollInfo` などは、メッセージを同期的に送ることがあります。送られたメッセージの処理で `with_app` が失敗するのは仕様です (そのメッセージは既定の処理になり、`App` 側は次の `refresh` で整合します)。スクロールバーは `SIF_DISABLENOSCROLL` で常に表示しておき、表示・非表示の切り替えによる WM_SIZE を起こさないようにしています。
+- `SetWindowTextW` などは、メッセージを同期的に送ることがあります。送られたメッセージの処理で `with_app` が失敗するのは仕様です (そのメッセージは既定の処理になり、`App` 側は次の `refresh` で整合します)。
+- スクロールバーはウィンドウ標準のもの (WS_VSCROLL / WS_HSCROLL) を使わず、`scrollbar.rs` で自前で描画・操作します。標準のものはクライアント領域の外周に付き、ステータスバーの横まで伸びるためです。欄 (`SCROLLBAR_W`) は本文の右 (`Geometry.text_right` 〜 右端) と下 (`text_bottom` 〜 `prompt_top`) に常に取ります (表示・非表示で本文の幅が変わらないように)。描画のたびに本体のタブの状態から作るので、状態の同期は要りません。
 
 ```rust
 enum Deferred { Open, OpenPaths(Vec<PathBuf>), Save(usize), SaveAs(usize), CloseTab(usize), Exit, Reopen(TextEncoding),
@@ -50,7 +51,7 @@ enum Deferred { Open, OpenPaths(Vec<PathBuf>), Save(usize), SaveAs(usize), Close
 | `WM_KEYDOWN` / `WM_KEYUP` (VK_CONTROL) | マウスが URL の上にあれば、カーソルを手の形に切り替える (`refresh_cursor`) |
 | `WM_MBUTTONUP` | タブ上なら、そのタブを閉じる |
 | `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL` | 120 = 3 行。端数は積算する (高精度タッチパッド対応)。Shift なら横、Ctrl なら文字サイズ |
-| `WM_VSCROLL` / `WM_HSCROLL` | スクロールバーの操作。つまみのドラッグは `SIF_TRACKPOS` で 32 ビットの位置を取る |
+| `WM_MOUSELEAVE` | スクロールバーのホバー表示を消す (ホバーし始めたときに `TrackMouseEvent` で要求する) |
 | `WM_SETCURSOR` | 本文の上では I ビーム (Ctrl を押して URL の上にあれば手の形)、それ以外では矢印 |
 | `WM_COMMAND` | メニュー ID → `Menus::command` → `App::execute_commands` |
 | `WM_INITMENUPOPUP` | `Menus::update` (文字コード・改行・テーマのチェック、Undo/Redo・切り取り・コピーの有効/無効) |
@@ -173,10 +174,13 @@ IMM32 を使います。
 - **有効化**: `App::update_detail_views` が、拡張子 (`.lvt` は常に、`.txt` は `App.txt_detail_view`) で各タブの `Document::set_detail_view` を切り替える。ファイルを開いたとき・保存したとき (拡張子が変わりうる)・開き直したとき・メニュー (表示 > .txt で装飾表示を使う) で切り替えたときに呼ぶ。設定は `settings.toml` の `txt_detail_view`。
 - **表示と座標**: `App::view_line(doc, line)` が `lvt_core::lineview::LineView` を返す (キャレット行ではキャレット位置を渡し、その要素を展開する)。描画 (`paint_text`)・クリック判定 (`hit_view` → `pos_at` / `url_at`)・キャレットの x 座標 (`col_x`、IME の位置) はすべてこれを使い、桁は `to_view` / `to_doc` で変換する。`[label](url)` の label は Ctrl+クリックで url を開く。ブロックキャレットはキャレット位置の文字の幅 (全角など) に合わせる。
 - **バッジ**: 装飾表示のタブでは行番号の欄を 2 文字分広げ、詳細のある行の行番号の右隣 (本文との間) に角丸のバッジ (メモの線 3 本) を描く (`App::badge_x` / `badge_at`)。クリックするとその行の詳細を編集し、右クリック (`WM_RBUTTONUP` → `App::on_right_click` → `Deferred::DetailMenu`) でメニュー (`dialogs::detail_menu`: 編集 / 削除) を出す。メニューはモーダルなので `App` の借用外で出す。削除は `App::delete_detail` → `Document::delete_detail` (行が空白だけになったら行ごと消す。1 回の Undo で戻せる)。
-- **見出し**: `LineView::heading` のある行は、行全体にアクセント色の半透明の帯を描く (h1 0.20、h2 0.14、h3 以降 0.09)。
+- **見出し**: `LineView::heading` のある行は、行全体にアクセント色の半透明の帯を描く (h1 0.20、h2 0.14、h3 以降 0.09。`heading_band`)。
+- **見出しの固定表示**: `app::sticky_headings` が、本文の先頭行を含む節の見出しの階層 (先頭行より上にあるもの。外側から最大 `STICKY_MAX` = 3 段、`STICKY_SCAN_LINES` 行まで遡る) を返す。固定した段の下に隠れる行も考えて、段数が変わらなくなるまで求め直す。`paint_sticky` が本文の上端に 1 段 1 行で重ねて描き (行番号・バッジ付き、下端に境界線と影)、クリックでその見出しへ移動する (`sticky_at`)。`ensure_caret_visible` はキャレット行が固定表示の下に隠れないように上へスクロールする。
+- **プレースホルダ**: 中身が空の `****`・`` `` ``・`[]()` は、空の位置に表示だけの文字 (`TokenKind::Placeholder`) を出す (`lineview::PLACEHOLDER_*`)。
+- **記法の補完**: 入力中 (`Tab.completion_hint`。`refresh` が、Vim のノーマルモードでなく選択がない操作対象のタブにだけ立てる) のキャレット行では、`App::view_line` が `LineView::with_completion` で開き記号 (`**`・`` ` ``・`[`) の残りをゴーストで示す。Tab (`App::complete_markup`) で閉じ記号を入れ (キャレットは中身の位置。空の要素なのでプレースホルダが出る)、要素の中の Tab は `lineview::tab_stop` の位置 (リンクの label → url → 要素の後ろ) へ進む。どちらもなければ通常の Tab。
 - **パネルの表示** (`paint_detail_panel`): キャレット行に詳細があれば、内容を本文と同じ装飾 (`decorate_lines`: 行ごとの `LineView` と URL) で折り返して表示する (幅は本文の 40%、260〜540 DIP。高さは本文の半分まで)。はみ出したら細いスクロールバー (`PanelScrollbar`) を出し、ホイールとつまみのドラッグでスクロールする (`App.panel_scroll`、行が変わったら先頭へ)。表示中のパネルの見出しの右端には削除ボタン (`App.panel_button`) を出す。編集中も同様に、編集用のタブの `scroll_line` を表すスクロールバーを出す。編集用の文書も装飾表示にする。枠は `paint_panel_frame` (角丸の本体と枠線、見出しの帯)。領域は `App.detail_panel` に記録し、クリック判定とカーソルの形に使う。
 - **位置**: `App.panel_pos` (本文の領域に対する割合)。見出しの帯をドラッグすると `Drag::Panel` で動かし、離したら `settings.toml` の `detail_panel_pos` に保存する。動かしていない (設定がない) ときは右上に置き、キャレット行と重なれば右下へ移す。
 - **パネル内の編集** (`panel.rs`): F2 / バッジのクリック / パネルのクリックで `start_detail_edit` → `App.detail_edit = Some(DetailEdit { tab, idx, line, original })`。
-  - 編集中は `App::tab()` / `tab_mut()` が編集用のタブを、`App::geometry()` がパネルの内側の配置 (`edit_geometry`) を返す。そのため、キー入力・入力モード (Vim)・IME・検索・Undo・`:` コマンドなどは、そのまま編集中の文書に働く。本体のスクロールバー・タイトルは `with_main` で本体を対象にして更新する。
+  - 編集中は `App::tab()` / `tab_mut()` が編集用のタブを、`App::geometry()` がパネルの内側の配置 (`edit_geometry`) を返す。そのため、キー入力・入力モード (Vim)・IME・検索・Undo・`:` コマンドなどは、そのまま編集中の文書に働く。本体のスクロールバー (常に本体のタブを表す)・タイトルは本体を対象にして更新する。
   - 閉じる: Esc (Vim はノーマルモードで、入力途中のキーがないとき)・Ctrl+Enter・F2・パネルの外のクリック・`:q` / `:wq` は反映して閉じる (`finish_detail_edit(true)` → `write_detail` で 1 回の Undo)。`:q!` は破棄、`:w` は反映して編集を続ける。
   - 本体のファイル・タブ・設定に関わる操作 (保存・タブ切り替え・終了など) の前には、反映して閉じる (`execute_app` と `run_deferred` の先頭)。

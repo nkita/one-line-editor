@@ -12,7 +12,7 @@ use lvt_core::encoding::{SaveError, TextEncoding};
 use lvt_core::history::MergeKind;
 use lvt_core::keymap::{InputMode, Key, KeyChord, Keymap, ModeResponse, StandardMode};
 use lvt_core::detail;
-use lvt_core::lineview::LineView;
+use lvt_core::lineview::{self, LineView};
 use lvt_core::link;
 use lvt_core::settings::Settings;
 use lvt_core::vim::{self, ex, Register, VimEdit, VimMode};
@@ -29,11 +29,10 @@ use windows::Win32::UI::Input::Ime::{
     ImmSetCompositionWindow, ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED, CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT,
     COMPOSITIONFORM, GCS_COMPATTR, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING,
 };
-use windows::Win32::UI::Controls::SetScrollInfo;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyMenu, GetClientRect, GetCursorPos, GetScrollInfo, SetMenu, WindowFromPoint, KillTimer, LoadCursorW, SetCursor, SetTimer, SetWindowTextW, IDC_ARROW,
-    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, SB_HORZ, SB_VERT, SCROLLBAR_CONSTANTS, SCROLLINFO, SIF_ALL, SIF_DISABLENOSCROLL, SIF_TRACKPOS,
+    DestroyMenu, GetClientRect, GetCursorPos, SetMenu, WindowFromPoint, KillTimer, LoadCursorW, SetCursor, SetTimer, SetWindowTextW, IDC_ARROW,
+    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT,
 };
 
 use super::input;
@@ -41,6 +40,7 @@ use super::menu::Menus;
 use super::panel::{DetailEdit, PanelRect, PanelScrollbar};
 use super::prompt::{Prompt, PromptKind};
 use super::render::{Renderer, DEFAULT_FONT_SIZE};
+use super::scrollbar::SCROLLBAR_W;
 use super::util::{char_to_utf16, utf16_to_char, wide};
 
 /// 1 行のうち描画・ヒットテストの対象にする最大文字数 (極端に長い行対策)。
@@ -48,6 +48,9 @@ pub const MAX_RENDER_CHARS: usize = 20_000;
 /// これより大きい文書ではインクリメンタル検索をしない (Enter で検索)。
 const INCREMENTAL_SEARCH_LIMIT: usize = 32 << 20;
 const AUTOSCROLL_TIMER: usize = 1;
+/// 固定表示する見出しの最大の段数と、親の見出しを探す最大の行数。
+const STICKY_MAX: usize = 3;
+const STICKY_SCAN_LINES: usize = 5000;
 
 pub struct Tab {
     pub doc: Document,
@@ -55,11 +58,13 @@ pub struct Tab {
     pub scroll_x: f32,
     /// これまでに描画した行の最大幅 (横スクロール範囲)。
     pub max_width: f32,
+    /// キャレットの位置に記法の補完の候補 (ゴースト) を表示するか (入力中のタブだけ。`refresh` が更新する)。
+    pub completion_hint: bool,
 }
 
 impl Tab {
     pub fn new(doc: Document) -> Self {
-        Self { doc, scroll_line: 0, scroll_x: 0.0, max_width: 0.0 }
+        Self { doc, scroll_line: 0, scroll_x: 0.0, max_width: 0.0, completion_hint: false }
     }
 }
 
@@ -101,6 +106,8 @@ pub struct Geometry {
     pub tabbar_h: f32,
     pub text_top: f32,
     pub text_bottom: f32,
+    /// 本文の右端 (この右は縦のスクロールバー)。
+    pub text_right: f32,
     pub prompt_top: f32,
     pub status_top: f32,
     pub gutter_w: f32,
@@ -132,6 +139,8 @@ enum Drag {
     Panel { ox: f32, oy: f32 },
     /// 詳細パネルのスクロールバーのつまみ (`grab` はつまみの上端からのマウスの位置)。
     PanelScroll { grab: f32 },
+    /// 本体のスクロールバーのつまみ (`grab` はつまみの開始位置からのマウスの位置)。
+    Scroll { vertical: bool, grab: f32 },
 }
 
 /// タブのドラッグを開始とみなす移動量 (DIP)。
@@ -157,6 +166,8 @@ pub struct App {
     pub tab_hits: Vec<TabHit>,
     drag: Option<Drag>,
     mouse: (f32, f32),
+    /// マウスが乗っているスクロールバー (true = 縦)。
+    scroll_hover: Option<bool>,
     wheel_accum: i32,
     high_surrogate: Option<u16>,
     pub ime: Option<ImeComposition>,
@@ -243,6 +254,7 @@ impl App {
             tab_hits: Vec::new(),
             drag: None,
             mouse: (0.0, 0.0),
+            scroll_hover: None,
             wheel_accum: 0,
             high_surrogate: None,
             ime: None,
@@ -333,12 +345,14 @@ impl App {
         // 装飾表示では、行番号の右隣に詳細のバッジの欄を設ける
         let badge = if self.main_tab().doc.detail_view() { 2.0 } else { 0.0 };
         let gutter_w = r.snap((digits as f32 + 2.0 + badge) * r.char_width);
+        // 縦・横のスクロールバーの欄は、本文の右と下 (入力欄・ステータスバーの上) に取る
         Geometry {
             width,
             height,
             tabbar_h,
             text_top: tabbar_h,
-            text_bottom: prompt_top,
+            text_bottom: (prompt_top - SCROLLBAR_W).max(tabbar_h),
+            text_right: (width - SCROLLBAR_W).max(0.0),
             prompt_top,
             status_top,
             gutter_w,
@@ -360,18 +374,25 @@ impl App {
 
     /// 表示用の行。装飾表示 (.txt / .lvt) では詳細をアイコンにし、記法の記号を隠す
     /// (キャレットのある要素だけは記法のまま)。
-    pub fn view_line(doc: &Document, line: usize) -> LineView {
+    /// 入力中 (`Tab.completion_hint`) のキャレット行では、記法の補完の候補も表示する。
+    pub fn view_line(tab: &Tab, line: usize) -> LineView {
+        let doc = &tab.doc;
         let text = Self::line_text(doc, line);
         if !doc.detail_view() {
             return LineView::plain(&text);
         }
         let (caret_line, caret_col) = doc.buffer().line_col(doc.caret_pos());
-        LineView::build(&text, (caret_line == line).then_some(caret_col))
+        let view = LineView::build(&text, (caret_line == line).then_some(caret_col));
+        if tab.completion_hint && caret_line == line {
+            view.with_completion(&text, caret_col)
+        } else {
+            view
+        }
     }
 
     /// 行内の文字位置の x 座標 (行頭からの DIP)。
     fn col_x(&self, line: usize, col: usize) -> f32 {
-        let view = Self::view_line(self.doc(), line);
+        let view = Self::view_line(self.tab(), line);
         let vcol = view.to_view(col, false);
         let text = view.text;
         let u: Vec<u16> = text.encode_utf16().collect();
@@ -448,13 +469,18 @@ impl App {
 
     /// 状態変更後の共通処理: スクロールバー・タイトル更新と再描画。
     pub fn refresh(&mut self) {
+        // 記法の補完の候補は、入力中 (Vim のノーマルモードでない・選択がない) の操作対象のタブにだけ出す
+        let hint = !self.mode.normal_caret() && self.prompt.is_none() && self.doc().selection().is_empty();
+        for t in &mut self.tabs {
+            t.completion_hint = false;
+        }
+        self.tab_mut().completion_hint = hint;
         if self.detail_edit.is_some() {
             self.clamp_scroll();
         }
-        // スクロールバーとタイトルは常に本体を表す
+        // タイトルは常に本体を表す (スクロールバーは描画のたびに本体の状態から作る)
         self.with_main(|a| {
             a.clamp_scroll();
-            a.update_scrollbars();
             a.update_title();
         });
         self.invalidate();
@@ -502,32 +528,12 @@ impl App {
     /// 本文の表示領域の幅 (DIP)。
     fn text_area_width(&self) -> f32 {
         let g = self.geometry();
-        (g.width - g.text_left).max(1.0)
+        (g.text_right - g.text_left).max(1.0)
     }
 
     /// 横スクロールの対象とする内容の幅 (最長行の右に少し余白を足す)。
     fn content_width(&self) -> f32 {
         self.tab().max_width + self.renderer.char_width * 4.0
-    }
-
-    fn update_scrollbars(&self) {
-        let vis = self.visible_lines();
-        let tab = self.tab();
-        let lines = tab.doc.buffer().len_lines();
-        let set = |bar: SCROLLBAR_CONSTANTS, max: i32, page: u32, pos: i32| {
-            let si = SCROLLINFO {
-                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_ALL | SIF_DISABLENOSCROLL,
-                nMin: 0,
-                nMax: max,
-                nPage: page,
-                nPos: pos,
-                nTrackPos: 0,
-            };
-            unsafe { SetScrollInfo(self.hwnd, bar, &si, true) };
-        };
-        set(SB_VERT, (lines.saturating_sub(1)).min(i32::MAX as usize) as i32, vis as u32, tab.scroll_line as i32);
-        set(SB_HORZ, self.content_width() as i32, self.text_area_width() as u32, tab.scroll_x as i32);
     }
 
     pub fn scroll_by(&mut self, lines: i64) {
@@ -551,7 +557,7 @@ impl App {
         };
         let x = self.col_x(line, col);
         let cw = self.renderer.char_width;
-        let text_w = (g.width - g.text_left).max(cw * 4.0);
+        let text_w = (g.text_right - g.text_left).max(cw * 4.0);
         let tab = self.tab_mut();
         if line < tab.scroll_line {
             tab.scroll_line = line;
@@ -564,6 +570,45 @@ impl App {
         } else if x > tab.scroll_x + text_w - cw * 2.0 {
             tab.scroll_x = x - text_w * 3.0 / 4.0;
         }
+        // 固定表示の見出しの下に隠れるなら、隠れなくなるまで上へスクロールする
+        if self.detail_edit.is_none() {
+            for _ in 0..=STICKY_MAX {
+                let tab = &mut self.tabs[self.active];
+                let n = sticky_headings(&tab.doc, tab.scroll_line).len();
+                if line < tab.scroll_line || line >= tab.scroll_line + n {
+                    break;
+                }
+                tab.scroll_line = line.saturating_sub(n);
+            }
+        }
+    }
+
+    /// 本体の上端に固定表示する見出しの行。
+    pub fn sticky_lines(&self) -> Vec<usize> {
+        let tab = self.main_tab();
+        sticky_headings(&tab.doc, tab.scroll_line)
+    }
+
+    /// 座標が固定表示の見出しの上なら、その見出しの行。
+    fn sticky_at(&self, g: &Geometry, x: f32, y: f32) -> Option<usize> {
+        if self.detail_edit.is_some() || y < g.text_top || x >= g.text_right {
+            return None;
+        }
+        let row = ((y - g.text_top) / self.renderer.line_height) as usize;
+        self.sticky_lines().get(row).copied()
+    }
+
+    /// 本体のスクロールバーがマウスで操作中・ホバー中なら、その向き (true = 縦)。
+    pub fn scrollbar_active(&self) -> Option<bool> {
+        match self.drag {
+            Some(Drag::Scroll { vertical, .. }) => Some(vertical),
+            Some(_) => None,
+            None => self.scroll_hover,
+        }
+    }
+
+    pub fn mouse_pos(&self) -> (f32, f32) {
+        self.mouse
     }
 
     /// 指定行が画面中央付近に来るようにスクロールする (検索・行移動用)。
@@ -1297,6 +1342,10 @@ impl App {
             self.refresh();
             return KeyOutcome::Handled(self.pending_deferred.take());
         }
+        // Tab: 記法の補完を確定する、または要素の中の次の位置へ進む (装飾表示で入力中のとき)
+        if key == Key::Tab && !mods.ctrl && !mods.alt && !mods.shift && self.tab().completion_hint && self.complete_markup() {
+            return KeyOutcome::Handled(None);
+        }
         // 文字キーは WM_CHAR で処理する (IME やキーボード配列の違いを OS に任せる)
         if input::is_text_key(key) && !mods.ctrl && !mods.alt {
             return KeyOutcome::Unhandled;
@@ -1313,6 +1362,33 @@ impl App {
             self.suppress_syschar = mods.alt;
         }
         outcome
+    }
+
+    /// Tab での補完。補完の候補があれば閉じ記号を入れ (キャレットは中身の位置のまま)、
+    /// キャレットが要素の中にあれば次の位置 (リンクの url、要素の後ろ) へ進む。どちらもなければ false。
+    fn complete_markup(&mut self) -> bool {
+        let doc = self.doc();
+        if !doc.detail_view() {
+            return false;
+        }
+        let pos = doc.caret_pos();
+        let (line, col) = doc.buffer().line_col(pos);
+        let text = Self::line_text(doc, line);
+        let ls = doc.buffer().line_to_char(line);
+        if let Some(c) = lineview::completion_at(&text, col) {
+            let doc = self.doc_mut();
+            doc.apply(vec![(pos..pos, c.insert.to_string())], MergeKind::None, |_, _| Selection::caret(pos));
+            doc.end_undo_group();
+        } else if let Some(to) = lineview::tab_stop(&text, col) {
+            let doc = self.doc_mut();
+            doc.set_selection(Selection::caret(ls + to));
+            doc.preferred_col = None;
+        } else {
+            return false;
+        }
+        self.ensure_caret_visible();
+        self.refresh();
+        true
     }
 
     pub fn on_char(&mut self, code: u16) -> Option<Deferred> {
@@ -1362,7 +1438,7 @@ impl App {
     /// 画面座標 (DIP) にある、表示用の行の文字位置。
     fn hit_view(&self, g: &Geometry, x: f32, y: f32) -> ViewHit {
         let line = self.line_at_y(g, y);
-        let view = Self::view_line(self.doc(), line);
+        let view = Self::view_line(self.tab(), line);
         let text = &view.text;
         let u: Vec<u16> = text.encode_utf16().collect();
         let tx = (x - g.text_left + self.tab().scroll_x).max(0.0);
@@ -1414,6 +1490,15 @@ impl App {
             self.scroll_panel_to_mouse(y, grab);
             return None;
         }
+        // 本体のスクロールバー (詳細の編集中も本体を動かす)
+        if let Some(sb) = self.main_scrollbar_at(x, y) {
+            if let Some(grab) = self.scrollbar_click(&sb, x, y) {
+                self.drag = Some(Drag::Scroll { vertical: sb.vertical, grab });
+                unsafe { SetCapture(self.hwnd) };
+                self.invalidate();
+            }
+            return None;
+        }
         if let Some(p) = self.detail_panel {
             // 見出しの帯: ドラッグでパネルを動かす
             if p.in_header(x, y) {
@@ -1438,6 +1523,17 @@ impl App {
             return self.tab_click(x, false);
         }
         if y < g.text_top || y >= g.text_bottom {
+            return None;
+        }
+        // 固定表示の見出し: その見出しの行へ移動する
+        if let Some(line) = self.sticky_at(&g, x, y) {
+            let pos = self.doc().buffer().line_to_char(line);
+            vim::leave_visual(self.doc_mut());
+            self.doc_mut().set_selection(Selection::caret(pos));
+            self.doc_mut().preferred_col = None;
+            self.tab_mut().scroll_line = line;
+            self.ensure_caret_visible();
+            self.mouse_selection_done();
             return None;
         }
         // 行番号の欄の詳細のバッジ: 詳細を編集する
@@ -1484,7 +1580,8 @@ impl App {
     pub fn on_mouse_move(&mut self, x: i32, y: i32) {
         self.mouse = self.to_dip(x, y);
         match self.drag {
-            None => return,
+            None => return self.update_scroll_hover(),
+            Some(Drag::Scroll { vertical, grab }) => return self.drag_scrollbar(vertical, grab),
             Some(Drag::Tab { idx, start_x, moved }) => return self.drag_tab(idx, start_x, moved),
             Some(Drag::Panel { ox, oy }) => return self.move_panel_to(self.mouse.0 - ox, self.mouse.1 - oy),
             Some(Drag::PanelScroll { grab }) => return self.scroll_panel_to_mouse(self.mouse.1, grab),
@@ -1514,7 +1611,7 @@ impl App {
                 let line = self.line_at_y(g, my);
                 self.select_lines(anchor_line, line);
             }
-            Some(Drag::Tab { .. } | Drag::Panel { .. } | Drag::PanelScroll { .. }) | None => return,
+            Some(Drag::Tab { .. } | Drag::Panel { .. } | Drag::PanelScroll { .. } | Drag::Scroll { .. }) | None => return,
         }
         self.refresh();
     }
@@ -1549,8 +1646,41 @@ impl App {
         }
         match drag {
             Drag::Tab { .. } | Drag::PanelScroll { .. } => {}
+            Drag::Scroll { .. } => {
+                self.update_scroll_hover();
+                self.invalidate();
+            }
             Drag::Panel { .. } => self.save_panel_pos(),
             _ => self.mouse_selection_done(),
+        }
+    }
+
+    /// マウスが乗っているスクロールバーを記録する (変わったら描き直す)。
+    /// ウィンドウの外に出たことを知るため WM_MOUSELEAVE を要求する。
+    fn update_scroll_hover(&mut self) {
+        let (x, y) = self.mouse;
+        let hover = self.main_scrollbar_at(x, y).map(|sb| sb.vertical);
+        if hover != self.scroll_hover {
+            self.scroll_hover = hover;
+            if hover.is_some() {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: self.hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe {
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
+            self.invalidate();
+        }
+    }
+
+    /// WM_MOUSELEAVE: スクロールバーのホバー表示を消す。
+    pub fn on_mouse_leave(&mut self) {
+        if self.scroll_hover.take().is_some() {
+            self.invalidate();
         }
     }
 
@@ -1648,62 +1778,6 @@ impl App {
         }
     }
 
-    pub fn on_scroll(&mut self, vertical: bool, code: u16) {
-        // スクロールバーは常に本体
-        if self.detail_edit.is_some() {
-            self.with_main(|a| a.on_scroll(vertical, code));
-            return self.invalidate();
-        }
-        const LINEUP: u16 = 0;
-        const LINEDOWN: u16 = 1;
-        const PAGEUP: u16 = 2;
-        const PAGEDOWN: u16 = 3;
-        const THUMBTRACK: u16 = 5;
-        const THUMBPOSITION: u16 = 4;
-        const TOP: u16 = 6;
-        const BOTTOM: u16 = 7;
-        let bar = if vertical { SB_VERT } else { SB_HORZ };
-        let track = || {
-            let mut si = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_TRACKPOS, ..Default::default() };
-            unsafe {
-                let _ = GetScrollInfo(self.hwnd, bar, &mut si);
-            }
-            si.nTrackPos
-        };
-        if vertical {
-            let page = self.visible_lines() as i64;
-            match code {
-                LINEUP => self.scroll_by(-1),
-                LINEDOWN => self.scroll_by(1),
-                PAGEUP => self.scroll_by(-page),
-                PAGEDOWN => self.scroll_by(page),
-                THUMBTRACK | THUMBPOSITION => {
-                    self.tab_mut().scroll_line = track().max(0) as usize;
-                    self.refresh();
-                }
-                TOP => self.scroll_by(i64::MIN / 2),
-                BOTTOM => self.scroll_by(i64::MAX / 2),
-                _ => {}
-            }
-        } else {
-            let cw = self.renderer.char_width;
-            let page = self.geometry().width / 2.0;
-            match code {
-                LINEUP => self.scroll_x_by(-cw * 4.0),
-                LINEDOWN => self.scroll_x_by(cw * 4.0),
-                PAGEUP => self.scroll_x_by(-page),
-                PAGEDOWN => self.scroll_x_by(page),
-                THUMBTRACK | THUMBPOSITION => {
-                    self.tab_mut().scroll_x = track().max(0) as f32;
-                    self.refresh();
-                }
-                TOP => self.scroll_x_by(f32::MIN / 2.0),
-                BOTTOM => self.scroll_x_by(f32::MAX / 2.0),
-                _ => {}
-            }
-        }
-    }
-
     /// WM_SETCURSOR: 編集領域では I ビーム。
     pub fn update_cursor(&self) {
         let g = self.main_geometry();
@@ -1711,7 +1785,7 @@ impl App {
         let panel = self.detail_panel;
         let id = if self.panel_button.is_some_and(|(l, t, r, b)| x >= l && x < r && y >= t && y < b) {
             IDC_HAND
-        } else if self.panel_scrollbar.is_some_and(|sb| sb.hit(x, y)) {
+        } else if self.panel_scrollbar.is_some_and(|sb| sb.hit(x, y)) || self.main_scrollbar_at(x, y).is_some() {
             IDC_ARROW
         } else if panel.is_some_and(|p| p.in_header(x, y)) {
             IDC_SIZEALL
@@ -1721,9 +1795,9 @@ impl App {
             } else {
                 IDC_HAND
             }
-        } else if self.badge_at(&g, x, y).is_some() {
+        } else if self.badge_at(&g, x, y).is_some() || self.sticky_at(&g, x, y).is_some() {
             IDC_HAND
-        } else if y < g.text_top || y >= g.text_bottom || x < g.gutter_w {
+        } else if y < g.text_top || y >= g.text_bottom || x < g.gutter_w || x >= g.text_right {
             IDC_ARROW
         } else if input::current_modifiers().ctrl
             && self.drag.is_none()
@@ -1917,4 +1991,42 @@ fn set_wait_cursor() {
             SetCursor(Some(c));
         }
     }
+}
+
+/// 上端に固定表示する見出し (装飾表示のときだけ)。行番号の昇順で、外側の見出しから最大 `STICKY_MAX` 段。
+/// 固定表示した段の下に隠れる行も考えて、段数が変わらなくなるまで求め直す。
+pub fn sticky_headings(doc: &Document, scroll_line: usize) -> Vec<usize> {
+    if !doc.detail_view() || scroll_line == 0 {
+        return Vec::new();
+    }
+    let mut stack = Vec::new();
+    for _ in 0..=STICKY_MAX {
+        let next = heading_ancestors(doc, scroll_line + stack.len());
+        if next == stack {
+            break;
+        }
+        stack = next;
+    }
+    stack
+}
+
+/// `top` 行を含む節の見出しの階層 (`top` より上にあるものだけ。内側の最大 `STICKY_MAX` 段)。
+fn heading_ancestors(doc: &Document, top: usize) -> Vec<usize> {
+    let buf = doc.buffer();
+    let top = top.min(buf.len_lines().saturating_sub(1));
+    // `top` 自身が見出しなら、それより上位の見出しだけが親
+    let mut limit = lineview::heading_level(buf.line(top).chars()).unwrap_or(7);
+    let mut out = Vec::new();
+    for line in (top.saturating_sub(STICKY_SCAN_LINES)..top).rev() {
+        if limit <= 1 {
+            break;
+        }
+        if let Some(level) = lineview::heading_level(buf.line(line).chars()).filter(|&l| l < limit) {
+            out.push(line);
+            limit = level;
+        }
+    }
+    out.truncate(STICKY_MAX);
+    out.reverse();
+    out
 }

@@ -57,6 +57,8 @@ pub struct Theme {
     pub accent: Color,
     pub search_match: Color,
     pub whitespace: Color,
+    /// 詳細パネルの枠線・固定表示の見出しの境界線など、本文の上に重ねる部品の境界。
+    pub panel_border: Color,
     tokens: [TextStyle; TokenKind::COUNT],
 }
 
@@ -83,6 +85,7 @@ impl Theme {
             accent: Color(0x2F6FDB),
             search_match: Color(0xFFE48A),
             whitespace: Color(0xC8C8C8),
+            panel_border: Color(0xB4B4B4),
             tokens: [
                 TextStyle::fg(0x0033B3).bold(),  // Keyword
                 TextStyle::fg(0x067D17),         // String
@@ -96,6 +99,7 @@ impl Theme {
                 TextStyle::fg(0x6A737D).italic(), // Quote
                 TextStyle::fg(0xD9730D).bold(),  // ListMarker
                 TextStyle::fg(0x8C8C8C),         // Punctuation
+                TextStyle::fg(0xB0B0B0).italic(), // Placeholder
             ],
         }
     }
@@ -118,6 +122,7 @@ impl Theme {
             accent: Color(0x3574F0),
             search_match: Color(0x5C4B12),
             whitespace: Color(0x45484D),
+            panel_border: Color(0x5A5E66),
             tokens: [
                 TextStyle::fg(0xCF8E6D).bold(),
                 TextStyle::fg(0x6AAB73),
@@ -131,6 +136,7 @@ impl Theme {
                 TextStyle::fg(0x8C8C8C).italic(),
                 TextStyle::fg(0xE0A050).bold(),
                 TextStyle::fg(0x7A7E85),
+                TextStyle::fg(0x62666D).italic(),
             ],
         }
     }

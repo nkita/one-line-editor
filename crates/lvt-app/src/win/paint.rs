@@ -54,6 +54,7 @@ impl App {
             badge_x: self.badge_x(&g),
         };
         paint_text(&mut self.renderer, &mut self.tabs[self.active], &g, &theme, &ctx);
+        self.paint_scrollbars(&g, &theme);
         if editing {
             self.paint_edit_panel(&g, &theme);
         } else {
@@ -74,13 +75,19 @@ impl App {
         self.panel_button = None;
         let r = &mut self.renderer;
         let rad = PANEL_RADIUS;
+        // 影: 少しずつ大きくした薄い角丸を重ねて、ぼかした影に近づける (下へ少しずらす)
+        let (layers, alpha) = if theme.name == "dark" { (8, 0.05) } else { (8, 0.022) };
+        for i in (1..=layers).rev() {
+            let d = i as f32;
+            r.fill_round(p.left - d, p.top - d + 2.0, p.right + d, p.bottom + d + 2.0, rad + d, Color(0x000000), alpha);
+        }
         r.fill_round(p.left, p.top, p.right, p.bottom, rad, theme.chrome_bg, 1.0);
         // 本文の部分 (見出しの帯の下) を背景色で塗る
         r.push_clip(p.left, p.header_bottom, p.right, p.bottom);
         r.fill_round(p.left, p.top, p.right, p.bottom, rad, theme.background, 1.0);
         r.pop_clip();
-        r.fill(p.left + 1.0, p.header_bottom, p.right - 1.0, p.header_bottom + 1.0, theme.tab_inactive_bg);
-        let border = if active { theme.accent } else { theme.tab_inactive_bg };
+        r.fill(p.left + 1.0, p.header_bottom, p.right - 1.0, p.header_bottom + 1.0, theme.panel_border);
+        let border = if active { theme.accent } else { theme.panel_border };
         r.stroke_round(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5, rad, border, if active { 1.5 } else { 1.0 });
 
         let hh = p.header_bottom - p.top;
@@ -91,7 +98,7 @@ impl App {
             let bw = r.text_width(label, &r.ui_format) + 16.0;
             let bh = (r.ui_line_height + 6.0).min(hh - 6.0);
             let (bx, by) = (right - bw + 4.0, p.top + (hh - bh) / 2.0);
-            r.stroke_round(bx + 0.5, by + 0.5, bx + bw - 0.5, by + bh - 0.5, 4.0, theme.tab_inactive_bg, 1.0);
+            r.stroke_round(bx + 0.5, by + 0.5, bx + bw - 0.5, by + bh - 0.5, 4.0, theme.panel_border, 1.0);
             r.draw_ui_text(label, bx + 8.0, by, bh, DANGER);
             button_rect = Some((bx, by, bx + bw, by + bh));
             right = bx - 10.0;
@@ -121,7 +128,7 @@ impl App {
             self.panel_scroll_line = Some(caret_line);
         }
 
-        let text_w = g.width - g.gutter_w;
+        let text_w = g.text_right - g.gutter_w;
         let text_h = g.text_bottom - g.text_top;
         if text_w < 280.0 || text_h < 140.0 {
             return;
@@ -187,6 +194,8 @@ impl App {
         let vis = self.visible_lines();
         if let Some(e) = &mut self.detail_edit {
             paint_text(&mut self.renderer, &mut e.tab, &eg, theme, &ctx);
+            // 本文 (現在行の帯・選択) の上から枠線を描き直す
+            self.renderer.stroke_round(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5, PANEL_RADIUS, theme.accent, 1.5);
             let lines = e.tab.doc.buffer().len_lines();
             if lines > vis {
                 let max = (lines - vis) as f32;
@@ -340,7 +349,7 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
     if ctx.gutter {
         r.fill(0.0, g.text_top, g.gutter_w, g.text_bottom, theme.gutter_bg);
     }
-    r.push_clip(g.gutter_w, g.text_top, g.width, g.text_bottom);
+    r.push_clip(g.gutter_w, g.text_top, g.text_right, g.text_bottom);
     for i in 0..rows {
         let line = tab.scroll_line + i;
         if line >= len_lines {
@@ -351,7 +360,7 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         let line_len = tab.doc.buffer().line_len(line);
         // 表示用の行 (装飾表示では詳細をアイコンにし、記法の記号を隠す)。
         // 文書上の桁 → 表示上の桁は `vcol` で変換する。
-        let view = App::view_line(&tab.doc, line);
+        let view = App::view_line(tab, line);
         let text = view.text.clone();
         let vcol = |col: usize| view.to_view(col, false);
         let caret_vcol = vcol(caret_col);
@@ -394,16 +403,10 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         let x_at = |col: usize| origin_x + Renderer::x_of(&layout, to_view(char_to_utf16(&text, vcol(col))));
 
         if line == caret_line && sel.is_empty() {
-            r.fill(g.gutter_w, y, g.width, y + lh, theme.current_line);
+            r.fill(g.gutter_w, y, g.text_right, y + lh, theme.current_line);
         }
-        // 見出し: 行全体に背景の帯 (レベルが上ほど濃い。テーマのアクセント色を半透明で使う)
         if let Some(level) = view.heading {
-            let alpha = match level {
-                1 => 0.20,
-                2 => 0.14,
-                _ => 0.09,
-            };
-            r.fill_round(g.gutter_w + 2.0, y + 1.0, g.width - 2.0, y + lh - 1.0, 3.0, theme.accent, alpha);
+            heading_band(r, g, y, level, theme);
         }
         if let Some(re) = ctx.matches {
             for m in re.find_iter(&text).filter(|m| !m.is_empty()) {
@@ -459,16 +462,9 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
             break;
         }
         let y = g.text_top + i as f32 * lh;
-        // 詳細のある行: 行番号の右隣にバッジ (角丸の地にメモの線 3 本)
-        if let Some((bx0, bx1)) = badge_x.filter(|_| tab.doc.detail_at_line(line).is_some()) {
-            let bh = (lh * 0.62).max(10.0);
-            let by = y + (lh - bh) / 2.0;
-            r.fill_round(bx0, by, bx1, by + bh, 3.0, theme.accent, 0.9);
-            for (k, frac) in [(0.3, 1.0), (0.5, 1.0), (0.7, 0.6)] {
-                let ly = by + bh * k;
-                let lx1 = bx0 + 3.0 + (bx1 - bx0 - 6.0) * frac;
-                r.fill(bx0 + 3.0, ly - 0.6, lx1, ly + 0.6, theme.background);
-            }
+        // 詳細のある行: 行番号の右隣にバッジ
+        if let Some(bx) = badge_x.filter(|_| tab.doc.detail_at_line(line).is_some()) {
+            paint_badge(r, bx, y, theme);
         }
         let num = (line + 1).to_string();
         // 行番号は右寄せ。バッジの欄があればその左に寄せる
@@ -482,6 +478,83 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
             }
             r.draw_layout(&layout, x, y, color);
         }
+    }
+
+    if ctx.gutter {
+        paint_sticky(r, tab, g, theme, badge_x);
+    }
+}
+
+/// 見出しの背景の帯。行全体に描く (レベルが上ほど濃い。テーマのアクセント色を半透明で使う)。
+fn heading_band(r: &mut Renderer, g: &Geometry, y: f32, level: u8, theme: &Theme) {
+    let lh = r.line_height;
+    let alpha = match level {
+        1 => 0.20,
+        2 => 0.14,
+        _ => 0.09,
+    };
+    r.fill_round(g.gutter_w + 2.0, y + 1.0, g.text_right - 2.0, y + lh - 1.0, 3.0, theme.accent, alpha);
+}
+
+/// スクロールで上に隠れた見出しを、本文の上端に固定表示する (外側の見出しから順に 1 行ずつ)。
+fn paint_sticky(r: &mut Renderer, tab: &Tab, g: &Geometry, theme: &Theme, badge_x: Option<(f32, f32)>) {
+    let lines = super::app::sticky_headings(&tab.doc, tab.scroll_line);
+    if lines.is_empty() {
+        return;
+    }
+    let lh = r.line_height;
+    let cw = r.char_width;
+    let format = r.text_format.clone();
+    let origin_x = g.text_left - tab.scroll_x;
+    let bottom = (g.text_top + lh * lines.len() as f32).min(g.text_bottom);
+    // 下に薄い影を付けて、本文と重なっていることを示す
+    r.push_clip(0.0, g.text_top, g.text_right, g.text_bottom);
+    r.fill_round(0.0, bottom, g.text_right, bottom + 4.0, 0.0, Color(0x000000), 0.08);
+    r.pop_clip();
+    r.push_clip(0.0, g.text_top, g.text_right, bottom);
+    r.fill(0.0, g.text_top, g.gutter_w, bottom, theme.gutter_bg);
+    r.fill(g.gutter_w, g.text_top, g.text_right, bottom, theme.background);
+    for (i, &line) in lines.iter().enumerate() {
+        let y = g.text_top + i as f32 * lh;
+        let view = LineView::build(&App::line_text(&tab.doc, line), None);
+        let Some(layout) = r.layout_str(&view.text, &format) else { continue };
+        unsafe {
+            let _ = layout.SetMaxHeight(lh);
+            let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        apply_styles(r, &layout, &view.text, &view.styles, theme);
+        r.push_clip(g.gutter_w, g.text_top, g.text_right, bottom);
+        heading_band(r, g, y, view.heading.unwrap_or(1), theme);
+        r.draw_layout(&layout, origin_x, y, theme.foreground);
+        r.pop_clip();
+        // 行番号と詳細のバッジ
+        if let Some(bx) = badge_x.filter(|_| view.detail.is_some()) {
+            paint_badge(r, bx, y, theme);
+        }
+        let num = (line + 1).to_string();
+        let num_right = badge_x.map_or(g.gutter_w - cw, |(bx0, _)| bx0 - cw * 0.5);
+        if let Some(layout) = r.layout_str(&num, &format) {
+            unsafe {
+                let _ = layout.SetMaxHeight(lh);
+                let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
+            r.draw_layout(&layout, num_right - cw * num.len() as f32, y, theme.gutter_fg);
+        }
+    }
+    r.pop_clip();
+    r.fill(0.0, bottom - 1.0, g.text_right, bottom, theme.panel_border);
+}
+
+/// 行番号の欄の詳細のバッジ (角丸の地にメモの線 3 本)。
+fn paint_badge(r: &mut Renderer, (bx0, bx1): (f32, f32), y: f32, theme: &Theme) {
+    let lh = r.line_height;
+    let bh = (lh * 0.62).max(10.0);
+    let by = y + (lh - bh) / 2.0;
+    r.fill_round(bx0, by, bx1, by + bh, 3.0, theme.accent, 0.9);
+    for (k, frac) in [(0.3, 1.0), (0.5, 1.0), (0.7, 0.6)] {
+        let ly = by + bh * k;
+        let lx1 = bx0 + 3.0 + (bx1 - bx0 - 6.0) * frac;
+        r.fill(bx0 + 3.0, ly - 0.6, lx1, ly + 0.6, theme.background);
     }
 }
 

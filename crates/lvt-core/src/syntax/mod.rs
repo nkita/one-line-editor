@@ -32,10 +32,12 @@ pub enum TokenKind {
     Quote,
     ListMarker,
     Punctuation,
+    /// 空の要素に表示するプレースホルダ (装飾表示)。
+    Placeholder,
 }
 
 impl TokenKind {
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 }
 
 /// 行内のバイト範囲とその種類。
