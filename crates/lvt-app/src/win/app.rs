@@ -73,6 +73,8 @@ pub enum Deferred {
     Exit,
     Reopen(TextEncoding),
     OpenUrl(String),
+    /// 詳細のバッジの右クリックメニュー (`x`, `y` はクライアント座標)。
+    DetailMenu { line: usize, x: i32, y: i32 },
     /// Vim の :q / :q! / :wq。最後のタブなら終了する。
     Quit { idx: usize, save: bool, force: bool },
 }
@@ -183,6 +185,8 @@ pub struct App {
     pub panel_scroll_line: Option<usize>,
     /// パネルのスクロールバー (スクロールできるときだけ。paint.rs が更新する)。
     pub panel_scrollbar: Option<PanelScrollbar>,
+    /// 表示中のパネルの見出しの削除ボタン (left, top, right, bottom)。paint.rs が更新する。
+    pub panel_button: Option<(f32, f32, f32, f32)>,
 }
 
 /// Vim キーバインドを使うか。設定がなければ Vim を既定にする。
@@ -257,6 +261,7 @@ impl App {
             panel_scroll: 0.0,
             panel_scroll_line: None,
             panel_scrollbar: None,
+            panel_button: None,
         })
     }
 
@@ -1395,6 +1400,13 @@ impl App {
     pub fn on_mouse_down(&mut self, x: i32, y: i32, double: bool) -> Option<Deferred> {
         let (x, y) = self.to_dip(x, y);
         self.status = None;
+        // パネルの削除ボタン: キャレット行の詳細を削除する
+        if self.panel_button.is_some_and(|(l, t, r, b)| x >= l && x < r && y >= t && y < b) {
+            let doc = &self.main_tab().doc;
+            let line = doc.buffer().char_to_line(doc.caret_pos());
+            self.delete_detail(line);
+            return None;
+        }
         if let Some(sb) = self.panel_scrollbar.filter(|sb| sb.hit(x, y)) {
             let grab = if y >= sb.thumb_top && y < sb.thumb_top + sb.thumb_h { y - sb.thumb_top } else { sb.thumb_h / 2.0 };
             self.drag = Some(Drag::PanelScroll { grab });
@@ -1571,6 +1583,14 @@ impl App {
         self.drag_to_mouse(&g);
     }
 
+    /// 右クリック: 行番号の欄の詳細のバッジなら、メニュー (編集・削除) を出す。
+    /// メニューはモーダルなので `Deferred` で `App` の借用を解いてから出す。
+    pub fn on_right_click(&mut self, x: i32, y: i32) -> Option<Deferred> {
+        let (dx, dy) = self.to_dip(x, y);
+        let g = self.main_geometry();
+        self.badge_at(&g, dx, dy).map(|line| Deferred::DetailMenu { line, x, y })
+    }
+
     pub fn on_middle_click(&mut self, x: i32, y: i32) -> Option<Deferred> {
         let (x, y) = self.to_dip(x, y);
         if y < self.geometry().tabbar_h {
@@ -1689,7 +1709,9 @@ impl App {
         let g = self.main_geometry();
         let (x, y) = self.mouse;
         let panel = self.detail_panel;
-        let id = if self.panel_scrollbar.is_some_and(|sb| sb.hit(x, y)) {
+        let id = if self.panel_button.is_some_and(|(l, t, r, b)| x >= l && x < r && y >= t && y < b) {
+            IDC_HAND
+        } else if self.panel_scrollbar.is_some_and(|sb| sb.hit(x, y)) {
             IDC_ARROW
         } else if panel.is_some_and(|p| p.in_header(x, y)) {
             IDC_SIZEALL

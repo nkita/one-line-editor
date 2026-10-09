@@ -33,7 +33,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R>   // try_borrow_mut �
 
 ```rust
 enum Deferred { Open, OpenPaths(Vec<PathBuf>), Save(usize), SaveAs(usize), CloseTab(usize), Exit, Reopen(TextEncoding),
-                OpenUrl(String), Quit { idx, save, force } }   // Quit は Vim の :q / :q! / :wq (最後のタブなら終了)
+                OpenUrl(String), Quit { idx, save, force }, DetailMenu { line, x, y } }   // Quit は Vim の :q / :q! / :wq (最後のタブなら終了)
 ```
 
 ## 3. メッセージ処理
@@ -172,8 +172,9 @@ IMM32 を使います。
 
 - **有効化**: `App::update_detail_views` が、拡張子 (`.lvt` は常に、`.txt` は `App.txt_detail_view`) で各タブの `Document::set_detail_view` を切り替える。ファイルを開いたとき・保存したとき (拡張子が変わりうる)・開き直したとき・メニュー (表示 > .txt で装飾表示を使う) で切り替えたときに呼ぶ。設定は `settings.toml` の `txt_detail_view`。
 - **表示と座標**: `App::view_line(doc, line)` が `lvt_core::lineview::LineView` を返す (キャレット行ではキャレット位置を渡し、その要素を展開する)。描画 (`paint_text`)・クリック判定 (`hit_view` → `pos_at` / `url_at`)・キャレットの x 座標 (`col_x`、IME の位置) はすべてこれを使い、桁は `to_view` / `to_doc` で変換する。`[label](url)` の label は Ctrl+クリックで url を開く。ブロックキャレットはキャレット位置の文字の幅 (全角など) に合わせる。
-- **バッジ**: 装飾表示のタブでは行番号の欄を 2 文字分広げ、詳細のある行の行番号の右隣 (本文との間) に角丸のバッジ (メモの線 3 本) を描く (`App::badge_x` / `badge_at`)。クリックするとその行の詳細を編集する。
-- **パネルの表示** (`paint_detail_panel`): キャレット行に詳細があれば、内容を本文と同じ装飾 (`decorate_lines`: 行ごとの `LineView` と URL) で折り返して表示する (幅は本文の 40%、260〜540 DIP。高さは本文の半分まで)。はみ出したら細いスクロールバー (`PanelScrollbar`) を出し、ホイールとつまみのドラッグでスクロールする (`App.panel_scroll`、行が変わったら先頭へ)。編集中も同様に、編集用のタブの `scroll_line` を表すスクロールバーを出す。編集用の文書も装飾表示にする。枠は `paint_panel_frame` (角丸の本体と枠線、見出しの帯)。領域は `App.detail_panel` に記録し、クリック判定とカーソルの形に使う。
+- **バッジ**: 装飾表示のタブでは行番号の欄を 2 文字分広げ、詳細のある行の行番号の右隣 (本文との間) に角丸のバッジ (メモの線 3 本) を描く (`App::badge_x` / `badge_at`)。クリックするとその行の詳細を編集し、右クリック (`WM_RBUTTONUP` → `App::on_right_click` → `Deferred::DetailMenu`) でメニュー (`dialogs::detail_menu`: 編集 / 削除) を出す。メニューはモーダルなので `App` の借用外で出す。削除は `App::delete_detail` → `Document::delete_detail` (行が空白だけになったら行ごと消す。1 回の Undo で戻せる)。
+- **見出し**: `LineView::heading` のある行は、行全体にアクセント色の半透明の帯を描く (h1 0.20、h2 0.14、h3 以降 0.09)。
+- **パネルの表示** (`paint_detail_panel`): キャレット行に詳細があれば、内容を本文と同じ装飾 (`decorate_lines`: 行ごとの `LineView` と URL) で折り返して表示する (幅は本文の 40%、260〜540 DIP。高さは本文の半分まで)。はみ出したら細いスクロールバー (`PanelScrollbar`) を出し、ホイールとつまみのドラッグでスクロールする (`App.panel_scroll`、行が変わったら先頭へ)。表示中のパネルの見出しの右端には削除ボタン (`App.panel_button`) を出す。編集中も同様に、編集用のタブの `scroll_line` を表すスクロールバーを出す。編集用の文書も装飾表示にする。枠は `paint_panel_frame` (角丸の本体と枠線、見出しの帯)。領域は `App.detail_panel` に記録し、クリック判定とカーソルの形に使う。
 - **位置**: `App.panel_pos` (本文の領域に対する割合)。見出しの帯をドラッグすると `Drag::Panel` で動かし、離したら `settings.toml` の `detail_panel_pos` に保存する。動かしていない (設定がない) ときは右上に置き、キャレット行と重なれば右下へ移す。
 - **パネル内の編集** (`panel.rs`): F2 / バッジのクリック / パネルのクリックで `start_detail_edit` → `App.detail_edit = Some(DetailEdit { tab, idx, line, original })`。
   - 編集中は `App::tab()` / `tab_mut()` が編集用のタブを、`App::geometry()` がパネルの内側の配置 (`edit_geometry`) を返す。そのため、キー入力・入力モード (Vim)・IME・検索・Undo・`:` コマンドなどは、そのまま編集中の文書に働く。本体のスクロールバー・タイトルは `with_main` で本体を対象にして更新する。

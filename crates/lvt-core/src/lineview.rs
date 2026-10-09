@@ -3,6 +3,7 @@
 //! 文書上の行から、表示用の文字列・書式・文書上の桁 ⇔ 表示上の桁の対応を作る。
 //! - 詳細 `*detail[…]` は隠す (幅 0)。詳細があることは行番号の欄のバッジで示す (UI 層)。
 //! - `[label](url)` は label だけ、`` `code` `` と `**強調**` は記号を隠して表示する。
+//! - 行頭の `#`〜`######` + 空白は見出し。記号を隠して太字にする (背景の帯は UI 層が描く)。
 //!   キャレットが要素の上 (両端を含む) にあるときは、その要素だけ元の記法のまま表示する。
 //!
 //! 状態は持たず、描画・クリック判定・上下移動のたびに作る (見えている行だけなので軽い)。
@@ -31,6 +32,8 @@ pub struct LineView {
     pub links: Vec<(Range<usize>, String)>,
     /// 行の詳細 (文書上の位置)。
     pub detail: Option<Token>,
+    /// 見出しのレベル (1〜6)。
+    pub heading: Option<u8>,
     folds: Vec<Fold>,
 }
 
@@ -80,6 +83,18 @@ impl LineView {
             view.extend(&chars[r.clone()]);
             *vlen += r.len();
         };
+        // 見出し: 行頭の記号を隠す (キャレットがこの行にあれば記号を見せる)
+        let heading = heading_prefix(&chars);
+        if let Some((_, prefix)) = heading {
+            if caret.is_some() {
+                push_raw(&mut view, &mut vlen, 0..prefix);
+                char_styles.push((0..prefix, TokenKind::Punctuation));
+            } else {
+                folds.push(Fold { doc: (0, prefix), view_len: 0, closing: false });
+            }
+            pos = prefix;
+        }
+        let heading_text_start = vlen;
         for (start, el) in items {
             push_raw(&mut view, &mut vlen, pos..start);
             match el {
@@ -122,13 +137,17 @@ impl LineView {
             }
         }
         push_raw(&mut view, &mut vlen, pos..chars.len());
+        if heading.is_some() {
+            // 見出しの本文全体を太字にする (先頭に入れて、コードなどの書式を後から重ねる)
+            char_styles.insert(0, (heading_text_start..vlen, TokenKind::Strong));
+        }
 
         let to_byte = |s: &str, c: usize| s.char_indices().nth(c).map_or(s.len(), |(b, _)| b);
         let byte_range = |r: &Range<usize>| to_byte(&view, r.start)..to_byte(&view, r.end);
         let styles =
             char_styles.iter().filter(|(r, _)| !r.is_empty()).map(|(r, k)| StyleSpan { range: byte_range(r), kind: *k }).collect();
         let links = char_links.iter().map(|(r, u)| (byte_range(r), u.clone())).collect();
-        Self { styles, links, detail: token, folds, text: view }
+        Self { styles, links, detail: token, heading: heading.map(|h| h.0), folds, text: view }
     }
 
     /// 文書上の桁 → 表示上の桁。隠した範囲の内側は、`round_up` なら置き換えの後ろ、そうでなければ前。
@@ -163,6 +182,22 @@ impl LineView {
             shift += (e - s) - f.view_len;
         }
         vcol + shift
+    }
+}
+
+/// 行頭の見出しの記号 (`#` 1〜6 個 + 空白、または `#` だけの行)。(レベル, 記号の文字数)。
+fn heading_prefix(chars: &[char]) -> Option<(u8, usize)> {
+    let hashes = chars.iter().take_while(|c| **c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    match chars.get(hashes) {
+        None => Some((hashes as u8, hashes)),
+        Some(' ' | '\t') => {
+            let spaces = chars[hashes..].iter().take_while(|c| **c == ' ' || **c == '\t').count();
+            Some((hashes as u8, hashes + spaces))
+        }
+        _ => None,
     }
 }
 
@@ -267,6 +302,24 @@ mod tests {
         // 詳細の中の記法は装飾しない
         let v = LineView::build("*detail[**x** `y`]", None);
         assert_eq!(v.text, "");
+    }
+
+    #[test]
+    fn headings() {
+        let v = LineView::build("## 見出し `x`", None);
+        assert_eq!(v.text, "見出し x");
+        assert_eq!(v.heading, Some(2));
+        assert_eq!(styles(&v), [("見出し x", TokenKind::Strong), ("x", TokenKind::Code)]);
+        assert_eq!(v.to_view(3, false), 0);
+        assert_eq!(v.to_doc(0), 0); // 記号の前 (行頭)
+        // キャレットがこの行にあれば記号を見せる
+        let v = LineView::build("## 見出し", Some(5));
+        assert_eq!(v.text, "## 見出し");
+        assert_eq!(styles(&v), [("見出し", TokenKind::Strong), ("## ", TokenKind::Punctuation)]);
+        assert_eq!(LineView::build("#", None).heading, Some(1));
+        for line in ["#tag", "####### x", " # x"] {
+            assert_eq!(LineView::build(line, None).heading, None, "{line}");
+        }
     }
 
     #[test]

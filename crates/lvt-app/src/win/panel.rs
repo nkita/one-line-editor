@@ -177,6 +177,17 @@ impl App {
         (line < tab.doc.buffer().len_lines() && tab.doc.detail_at_line(line).is_some()).then_some(line)
     }
 
+    /// 本体の `line` 行の詳細を削除する (行が空白だけになったら行ごと)。1 回の Undo で戻せる。
+    pub fn delete_detail(&mut self, line: usize) {
+        self.finish_detail_edit(true);
+        if self.tabs[self.active].doc.delete_detail(line) {
+            let undo = if self.vim_enabled { "u" } else { "Ctrl+Z" };
+            self.status = Some(format!("詳細を削除しました ({undo} で元に戻せます)"));
+            self.ensure_caret_visible();
+        }
+        self.refresh();
+    }
+
     /// ドラッグで動かした位置を設定に保存する。
     pub fn save_panel_pos(&mut self) {
         let Some((fx, fy)) = self.panel_pos else { return };

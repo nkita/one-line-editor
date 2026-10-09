@@ -248,3 +248,14 @@ fn detail_tokens() {
     assert_eq!(h.clip.as_ref().unwrap().text, " ");
     h.keys("l").check("a *detail[q]b", 2); // 最後の見える文字 b (= 詳細の直前の位置)
 }
+
+#[test]
+fn x_on_detail_lines() {
+    let mut h = Harness::new("a\n*detail[q]\nb", 2);
+    h.doc.set_detail_view(true);
+    h.keys("x").check("a\n\nb", 2); // 詳細だけの行: 詳細を消す
+    h.keys("x").check("a\n\nb", 2); // 空行の x は何もしない (行を結合しない)
+    let mut h = Harness::new("ab *detail[q]\nc", 0);
+    h.doc.set_detail_view(true);
+    h.keys("$x").check("ab*detail[q]\nc", 1);
+}

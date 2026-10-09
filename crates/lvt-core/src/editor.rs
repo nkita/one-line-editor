@@ -55,6 +55,8 @@ pub fn execute(doc: &mut Document, cmd: &EditCommand, cfg: &EditorConfig, view: 
         }
         E::InsertTab => insert_tab(doc, cfg),
         E::Outdent => outdent(doc, cfg),
+        // 見た目が空の行 (詳細だけの行) では、行を結合する前に詳細を消す
+        E::DeleteBackward | E::DeleteForward if delete_blank_line_detail(doc) => {}
         E::DeleteBackward => delete_with(doc, MergeKind::Deleting, |_, p| p.saturating_sub(1)..p),
         E::DeleteForward => delete_with(doc, MergeKind::Deleting, |b, p| p..(p + 1).min(b.len_chars())),
         E::DeleteWordBackward => delete_with(doc, MergeKind::None, |b, p| word_left(b, p)..p),
@@ -285,6 +287,16 @@ fn select_whole_lines(buf: &TextBuffer, lines: &Range<usize>) -> Selection {
     Selection::new(buf.line_to_char(lines.start), end)
 }
 
+/// キャレットのある行が詳細と空白だけなら、詳細を消して空行を残す (消したら true)。
+fn delete_blank_line_detail(doc: &mut Document) -> bool {
+    let sel = doc.selection();
+    if !sel.is_empty() || !doc.detail_view() {
+        return false;
+    }
+    let line = doc.buffer().char_to_line(sel.head);
+    doc.delete_detail_on_blank_line(line)
+}
+
 /// 選択があれば選択を、なければ `range_of(caret)` を削除する。
 fn delete_with(doc: &mut Document, merge: MergeKind, range_of: impl Fn(&TextBuffer, usize) -> Range<usize>) {
     let sel = doc.selection();
@@ -499,5 +511,44 @@ mod detail_tests {
         let mut d = doc("**b**cd\nabcdef", 9);
         run(&mut d, &[mv(Motion::Up)]); // 表示 "bcd" の 1 桁目 = b の後ろ (閉じ記号の外)
         assert_eq!(d.selection().head, 5);
+    }
+
+    #[test]
+    fn delete_detail_and_blank_line() {
+        let cases = [
+            ("abc *detail[x]\nnext", 0, "abc\nnext"),
+            ("a *detail[x] b", 0, "a b"),
+            ("*detail[x] b", 0, " b"),
+            ("*detail[x]\nnext", 0, "next"),
+            ("  *detail[x]  \nnext", 0, "next"),
+            ("prev\n*detail[x]", 1, "prev"),
+            ("*detail[x]", 0, ""),
+        ];
+        for (text, line, expected) in cases {
+            let mut d = doc(text, 0);
+            assert!(d.delete_detail(line), "{text}");
+            assert_eq!(d.buffer().to_string(), expected, "{text}");
+            d.undo();
+            assert_eq!(d.buffer().to_string(), text, "{text}");
+        }
+        let mut d = doc("no detail", 0);
+        assert!(!d.delete_detail(0));
+    }
+
+    #[test]
+    fn backspace_on_detail_only_line_removes_detail_first() {
+        for cmd in [EditCommand::DeleteBackward, EditCommand::DeleteForward] {
+            let mut d = doc("prev\n  *detail[x]\nnext", 5);
+            run(&mut d, std::slice::from_ref(&cmd)); // 1 回目: 詳細だけ消えて空行が残る
+            assert_eq!((d.buffer().to_string().as_str(), d.selection().head), ("prev\n\nnext", 5));
+            run(&mut d, std::slice::from_ref(&cmd)); // 2 回目: 通常どおり行を結合する
+            assert_eq!(d.buffer().len_lines(), 2);
+            run(&mut d, &[EditCommand::Undo, EditCommand::Undo]);
+            assert_eq!(d.buffer().to_string(), "prev\n  *detail[x]\nnext");
+        }
+        // 見える文字がある行では通常の BS
+        let mut d = doc("ab *detail[x]", 2);
+        run(&mut d, &[EditCommand::DeleteBackward]);
+        assert_eq!(d.buffer().to_string(), "a *detail[x]");
     }
 }

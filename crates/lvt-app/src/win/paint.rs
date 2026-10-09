@@ -5,7 +5,7 @@ use lvt_core::detail;
 use lvt_core::lineview::LineView;
 use lvt_core::link;
 use lvt_core::syntax::{StyleSpan, TokenKind};
-use lvt_core::theme::Theme;
+use lvt_core::theme::{Color, Theme};
 use regex::Regex;
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextLayout, DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_WEIGHT_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
@@ -16,6 +16,9 @@ use super::app::{prompt_input_left, status_prompt_text_left, App, Geometry, ImeC
 use super::panel::{PanelRect, PanelScrollbar, PANEL_RADIUS};
 use super::render::Renderer;
 use super::util::{byte_to_utf16, char_to_utf16};
+
+/// 削除ボタンの文字色 (ライト・ダークどちらの背景でも読める赤)。
+const DANGER: Color = Color(0xD9443B);
 
 struct TextCtx<'a> {
     focused: bool,
@@ -39,6 +42,7 @@ impl App {
 
         let editing = self.detail_edit.is_some();
         self.panel_scrollbar = None;
+        self.panel_button = None;
         let matches = if self.highlight_matches { self.search_re.as_ref() } else { None };
         // 詳細の編集中は、本体にキャレット・IME・検索の強調を描かない
         let ctx = TextCtx {
@@ -65,7 +69,9 @@ impl App {
     }
 
     /// パネルの枠 (角丸・見出しの帯) を描く。
-    fn paint_panel_frame(&mut self, p: &PanelRect, theme: &Theme, title: &str, hint: &str, active: bool) {
+    /// `button` があれば見出しの右端にボタン (削除など) を描き、その領域を `App.panel_button` に記録する。
+    fn paint_panel_frame(&mut self, p: &PanelRect, theme: &Theme, title: &str, hint: &str, active: bool, button: Option<&str>) {
+        self.panel_button = None;
         let r = &mut self.renderer;
         let rad = PANEL_RADIUS;
         r.fill_round(p.left, p.top, p.right, p.bottom, rad, theme.chrome_bg, 1.0);
@@ -78,13 +84,26 @@ impl App {
         r.stroke_round(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5, rad, border, if active { 1.5 } else { 1.0 });
 
         let hh = p.header_bottom - p.top;
-        r.push_clip(p.left + 12.0, p.top, p.right - 12.0, p.header_bottom);
+        let mut right = p.right - 12.0;
+        let mut button_rect = None;
+        if let Some(label) = button {
+            // 枠線だけの小さなボタン (危険な操作なので文字は赤)
+            let bw = r.text_width(label, &r.ui_format) + 16.0;
+            let bh = (r.ui_line_height + 6.0).min(hh - 6.0);
+            let (bx, by) = (right - bw + 4.0, p.top + (hh - bh) / 2.0);
+            r.stroke_round(bx + 0.5, by + 0.5, bx + bw - 0.5, by + bh - 0.5, 4.0, theme.tab_inactive_bg, 1.0);
+            r.draw_ui_text(label, bx + 8.0, by, bh, DANGER);
+            button_rect = Some((bx, by, bx + bw, by + bh));
+            right = bx - 10.0;
+        }
+        r.push_clip(p.left + 12.0, p.top, right, p.header_bottom);
         let hint_w = r.text_width(hint, &r.ui_format);
         let tw = r.draw_ui_text(title, p.left + 12.0, p.top, hh, theme.chrome_fg);
-        if p.left + 12.0 + tw + 16.0 + hint_w < p.right - 12.0 {
-            r.draw_ui_text(hint, p.right - 12.0 - hint_w, p.top, hh, theme.gutter_fg);
+        if p.left + 12.0 + tw + 16.0 + hint_w < right {
+            r.draw_ui_text(hint, right - hint_w, p.top, hh, theme.gutter_fg);
         }
         r.pop_clip();
+        self.panel_button = button_rect;
     }
 
     /// キャレット行の詳細 (`*detail[…]`) の内容を表示する。位置は `panel_rect` (既定は右上で、キャレット行を避ける)。
@@ -134,7 +153,7 @@ impl App {
         let p = self.panel_rect(g, w, h, Some((caret_y, caret_y + r.line_height)));
 
         let title = format!("詳細 · {} 行目", caret_line + 1);
-        self.paint_panel_frame(&p, theme, &title, "クリック / F2 で編集", false);
+        self.paint_panel_frame(&p, theme, &title, "クリック / F2 で編集", false, Some("削除"));
         let max_scroll = (m.height - body_h).max(0.0);
         self.panel_scroll = self.panel_scroll.clamp(0.0, max_scroll);
         let body_top = p.header_bottom + pad;
@@ -155,7 +174,7 @@ impl App {
         let line = self.detail_edit.as_ref().map_or(0, |e| e.line);
         let hint = if self.vim_enabled { "Esc: 反映して閉じる   :q!: 破棄" } else { "Esc / Ctrl+Enter: 反映して閉じる" };
         let title = format!("詳細を編集 · {} 行目", line + 1);
-        self.paint_panel_frame(&p, theme, &title, hint, true);
+        self.paint_panel_frame(&p, theme, &title, hint, true, None);
         let eg = self.edit_geometry(*g);
         let ctx = TextCtx {
             focused: self.focused,
@@ -376,6 +395,15 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
 
         if line == caret_line && sel.is_empty() {
             r.fill(g.gutter_w, y, g.width, y + lh, theme.current_line);
+        }
+        // 見出し: 行全体に背景の帯 (レベルが上ほど濃い。テーマのアクセント色を半透明で使う)
+        if let Some(level) = view.heading {
+            let alpha = match level {
+                1 => 0.20,
+                2 => 0.14,
+                _ => 0.09,
+            };
+            r.fill_round(g.gutter_w + 2.0, y + 1.0, g.width - 2.0, y + lh - 1.0, 3.0, theme.accent, alpha);
         }
         if let Some(re) = ctx.matches {
             for m in re.find_iter(&text).filter(|m| !m.is_empty()) {

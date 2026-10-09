@@ -173,3 +173,36 @@ pub fn open_url(hwnd: HWND, url: &str) {
         error(hwnd, &format!("URL を開けませんでした:\n{url}"));
     }
 }
+
+pub enum DetailAction {
+    Edit,
+    Delete,
+}
+
+/// 詳細のバッジの右クリックメニュー。`x`, `y` はクライアント座標。選ばれなければ None。
+pub fn detail_menu(hwnd: HWND, x: i32, y: i32) -> Option<DetailAction> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+    const EDIT: usize = 1;
+    const DELETE: usize = 2;
+    let mut pt = POINT { x, y };
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut pt);
+        let menu = CreatePopupMenu().ok()?;
+        let edit = wide("詳細を編集(&E)\tF2");
+        let delete = wide("詳細を削除(&D)");
+        let _ = AppendMenuW(menu, MF_STRING, EDIT, PCWSTR(edit.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, DELETE, PCWSTR(delete.as_ptr()));
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None).0 as usize;
+        let _ = DestroyMenu(menu);
+        match cmd {
+            EDIT => Some(DetailAction::Edit),
+            DELETE => Some(DetailAction::Delete),
+            _ => None,
+        }
+    }
+}

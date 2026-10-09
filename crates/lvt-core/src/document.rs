@@ -253,6 +253,61 @@ impl Document {
         s..e.max(s)
     }
 
+    /// 行の詳細を削除する (1 回の Undo で戻せる)。詳細の前後の余分な空白も消し、
+    /// 行が空白だけになったら行ごと消す。詳細がなければ false。
+    pub fn delete_detail(&mut self, line: usize) -> bool {
+        self.delete_detail_with(line, false)
+    }
+
+    /// 見た目が空の行 (詳細と空白だけの行) なら、その行の詳細を削除して空行を残す。
+    /// キャレットがそこにある状態で BS / Del を押したときに使う (行の結合より先に詳細を消す)。
+    pub fn delete_detail_on_blank_line(&mut self, line: usize) -> bool {
+        let Some(t) = self.detail_at_line(line) else { return false };
+        let s = self.buffer.line(line);
+        let blank = s.chars().take(t.start).chain(s.chars().skip(t.end)).all(|c| c == ' ' || c == '\t');
+        blank && self.delete_detail_with(line, true)
+    }
+
+    /// `keep_line` なら、行が空白だけになっても行は残す (空行にする)。
+    fn delete_detail_with(&mut self, line: usize, keep_line: bool) -> bool {
+        let Some(t) = self.detail_at_line(line) else { return false };
+        let buf = &self.buffer;
+        let ls = buf.line_to_char(line);
+        let chars: Vec<char> = buf.line(line).chars().collect();
+        let is_ws = |c: &char| *c == ' ' || *c == '\t';
+        let (mut s, mut e) = (t.start, t.end);
+        if e == chars.len() {
+            // 行末の詳細: 前の空白も消す
+            while s > 0 && is_ws(&chars[s - 1]) {
+                s -= 1;
+            }
+        } else if s > 0 && is_ws(&chars[s - 1]) && is_ws(&chars[e]) {
+            // 行の途中: 前後の空白が重ならないよう、後ろの空白を 1 つ消す
+            e += 1;
+        }
+        let rest_blank = chars[..s].iter().chain(&chars[e..]).all(is_ws);
+        let n = buf.len_lines();
+        let (range, caret) = if !rest_blank {
+            (ls + s..ls + e, ls + s)
+        } else if keep_line {
+            (ls..ls + chars.len(), ls)
+        } else if line + 1 < n {
+            (ls..buf.line_to_char(line + 1), ls)
+        } else if line > 0 {
+            (buf.line_end(line - 1)..buf.len_chars(), buf.line_to_char(line - 1))
+        } else {
+            (0..buf.len_chars(), 0)
+        };
+        // 詳細の削除そのものなので、見えない詳細に合わせた範囲の調整はしない
+        let dv = std::mem::replace(&mut self.detail_view, false);
+        self.apply(vec![(range, String::new())], MergeKind::None, |_, _| Selection::caret(caret));
+        self.detail_view = dv;
+        let sel = self.selection;
+        self.selection = self.snap_selection(sel, sel);
+        self.preferred_col = None;
+        true
+    }
+
     /// 挿入位置を調整する。詳細の内側への挿入は詳細の後ろへ。行末にある詳細の直前に
     /// 改行を挿入する場合 (行末で Enter) は、詳細を元の行に残すため詳細の後ろへ。
     fn adjust_insert(&self, p: usize, text: &str) -> usize {

@@ -170,6 +170,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             with_app(|a| a.on_mouse_up());
             true
         }
+        WM_RBUTTONUP => {
+            let (x, y) = point_from_lparam(lp);
+            match with_app(|a| a.on_right_click(x, y)).flatten() {
+                Some(d) => {
+                    run_deferred(hwnd, d);
+                    true
+                }
+                None => false,
+            }
+        }
         WM_MBUTTONUP => {
             let (x, y) = point_from_lparam(lp);
             if let Some(d) = with_app(|a| a.on_middle_click(x, y)).flatten() {
@@ -313,6 +323,15 @@ fn run_deferred(hwnd: HWND, d: Deferred) {
         }
         Deferred::Reopen(enc) => reopen(hwnd, enc),
         Deferred::OpenUrl(url) => dialogs::open_url(hwnd, &url),
+        Deferred::DetailMenu { line, x, y } => match dialogs::detail_menu(hwnd, x, y) {
+            Some(dialogs::DetailAction::Edit) => {
+                with_app(|a| a.start_detail_edit(line));
+            }
+            Some(dialogs::DetailAction::Delete) => {
+                with_app(|a| a.delete_detail(line));
+            }
+            None => {}
+        },
         Deferred::Quit { idx, save: write, force } => {
             if write && !save(hwnd, idx, false) {
                 with_app(|a| a.refresh());

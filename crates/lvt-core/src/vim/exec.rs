@@ -167,6 +167,16 @@ fn operate(
     cfg: &EditorConfig,
     view: &ViewInfo,
 ) -> Option<Register> {
+    // x / X: 見た目が空の行 (詳細だけの行) では詳細を消す (BS / Del と同じ)
+    if op == Operator::Delete
+        && matches!(target, OpTarget::Motion(VimMotion::Right | VimMotion::Left))
+        && doc.visual.is_none()
+    {
+        let line = doc.buffer().char_to_line(cursor(doc));
+        if doc.delete_detail_on_blank_line(line) {
+            return None;
+        }
+    }
     let buf = doc.buffer();
     let pos = cursor(doc);
     let n = count.unwrap_or(1).max(1);
@@ -191,7 +201,17 @@ fn operate(
     };
     // 見えない詳細に合わせて範囲を調整する (ヤンクする文字列も実際に消す範囲に合わせる)
     let span = match span {
-        Span::Chars(r) => Span::Chars(doc.adjust_range(r)),
+        Span::Chars(r) => {
+            let adjusted = doc.adjust_range(r.clone());
+            // 1 行の中の範囲が、詳細を飛び越えたことで次の行へはみ出さないようにする (x で行を結合しない)
+            let buf = doc.buffer();
+            let line_end = buf.line_end(buf.char_to_line(r.start));
+            if r.end <= line_end && adjusted.end > line_end {
+                Span::Chars(adjusted.start.min(line_end)..line_end)
+            } else {
+                Span::Chars(adjusted)
+            }
+        }
         lines => lines,
     };
     doc.visual = None;
