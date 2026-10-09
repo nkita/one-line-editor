@@ -17,6 +17,7 @@ pub mod editor;
 pub mod encoding;
 pub mod history;
 pub mod keymap;
+pub mod lineview;
 pub mod link;
 pub mod search;
 pub mod selection;

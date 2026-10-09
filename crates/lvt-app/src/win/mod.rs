@@ -1,11 +1,11 @@
 //! Windows フロントエンドの入口: ウィンドウ生成・メッセージ処理・ダイアログを伴う処理。
 
 mod app;
-mod detail_editor;
 mod dialogs;
 mod input;
 mod menu;
 mod paint;
+mod panel;
 mod prompt;
 mod render;
 mod util;
@@ -282,6 +282,10 @@ fn dropped_files(hdrop: HDROP) -> Vec<PathBuf> {
 // ---- モーダルダイアログを伴う処理 (App を借用していない状態で呼ぶ) ----
 
 fn run_deferred(hwnd: HWND, d: Deferred) {
+    // 保存・終了などの前に、パネルで編集中の詳細を反映する
+    if !matches!(d, Deferred::OpenUrl(_)) {
+        with_app(|a| a.finish_detail_edit(true));
+    }
     match d {
         Deferred::Open => {
             let files = dialogs::open_files(hwnd);
@@ -309,14 +313,6 @@ fn run_deferred(hwnd: HWND, d: Deferred) {
         }
         Deferred::Reopen(enc) => reopen(hwnd, enc),
         Deferred::OpenUrl(url) => dialogs::open_url(hwnd, &url),
-        Deferred::EditDetail { idx, line } => {
-            if let Some(initial) = with_app(|a| a.detail_text(idx, line)).flatten() {
-                let title = format!("詳細の編集 ({} 行目)", line + 1);
-                if let Some(text) = detail_editor::edit(hwnd, &title, &initial) {
-                    with_app(|a| a.write_detail(idx, line, &text));
-                }
-            }
-        }
         Deferred::Quit { idx, save: write, force } => {
             if write && !save(hwnd, idx, false) {
                 with_app(|a| a.refresh());

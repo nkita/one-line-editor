@@ -15,7 +15,7 @@ Win32 API と Direct2D/DirectWrite で書かれた UI 層です。`windows` crat
 | `win/prompt.rs` | `Prompt`: 下部の 1 行入力欄の状態 (種類・テキスト・キャレット) |
 | `win/dialogs.rs` | ファイルを開く/保存ダイアログ、メッセージボックス、クリップボード (CRLF ⇔ LF の変換) |
 | `win/input.rs` | 仮想キーコード → `Key`、修飾キーの状態 |
-| `win/detail_editor.rs` | 詳細 (`*[…]`) の編集ウィンドウ (モーダル。標準の EDIT コントロール) |
+| `win/panel.rs` | 詳細パネル: 位置の計算・ドラッグ・パネル内での編集の開始と終了 (`DetailEdit`) |
 | `win/util.rs` | UTF-16 変換 (文字・バイト ⇔ UTF-16 位置)、lParam/wParam の分解 |
 | `build.rs` + `res/` | アプリケーション マニフェスト (`res/lvt.manifest`) を exe に埋め込む。コモンコントロール v6 を指定し、ダイアログ・メッセージボックスを現行の Windows の見た目にする。GNU では `x86_64-w64-mingw32-windres` でリソースを作ってリンクし、MSVC ではリンカーの `/MANIFESTINPUT` を使う |
 
@@ -33,7 +33,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R>   // try_borrow_mut �
 
 ```rust
 enum Deferred { Open, OpenPaths(Vec<PathBuf>), Save(usize), SaveAs(usize), CloseTab(usize), Exit, Reopen(TextEncoding),
-                OpenUrl(String), Quit { idx, save, force }, EditDetail { idx, line } }   // Quit は Vim の :q / :q! / :wq (最後のタブなら終了)
+                OpenUrl(String), Quit { idx, save, force } }   // Quit は Vim の :q / :q! / :wq (最後のタブなら終了)
 ```
 
 ## 3. メッセージ処理
@@ -168,9 +168,14 @@ IMM32 を使います。
 - タブを切り替えたら、元のタブの Undo のまとめとビジュアルモードを終え、`InputMode::reset` で入力途中の状態を破棄する。
 - ヤンク・削除した文字列 (`editor::execute` の戻り値) はクリップボードに置き、`App.register` に覚える (`p` で行単位かどうかを判断するため)。
 
-## 14. 詳細 (`*[…]`) の表示と編集
+## 14. 装飾表示と詳細パネル
 
-- **有効化**: `App::update_detail_views` が、拡張子 (`.lvt` は常に、`.txt` は `App.txt_detail_view`) で各タブの `Document::set_detail_view` を切り替える。ファイルを開いたとき・保存したとき (拡張子が変わりうる)・開き直したとき・メニューで切り替えたときに呼ぶ。設定は `settings.toml` の `txt_detail_view`。
-- **表示と座標**: `App::view_line(doc, line)` が表示用の行 (詳細をアイコンに置き換えたもの) と `Token` を返す。描画 (`paint_text`)・クリック判定 (`hit_view` → `pos_at` / `url_at`)・キャレットの x 座標 (`col_x`、IME の位置) はすべてこれを使い、桁は `Token::to_view` / `to_doc` で変換する。ブロックキャレットはキャレット位置の文字の幅 (アイコン・全角) に合わせる。
-- **パネル** (`paint_detail_panel`): キャレット行に詳細があれば、本文の右上に内容を折り返して表示する (幅は本文の 40%、240〜520 DIP。高さは本文の半分まで、はみ出したら「…」)。キャレット行と重なる場合は右下に置く。領域は `App.detail_panel` に記録し、クリック判定とカーソルの形に使う。
-- **編集**: `F2` (`AppCommand::EditDetail`)、アイコンのダブルクリック、パネルのクリックで `Deferred::EditDetail {idx, line}` → `detail_editor::edit` (モーダル。Ctrl+Enter で確定、Esc でキャンセル) → `App::write_detail` で内容をエスケープして書き戻す (1 回の Undo)。行に詳細がなければ、行頭 (インデントの後ろ) に `*[…] ` を作る。
+- **有効化**: `App::update_detail_views` が、拡張子 (`.lvt` は常に、`.txt` は `App.txt_detail_view`) で各タブの `Document::set_detail_view` を切り替える。ファイルを開いたとき・保存したとき (拡張子が変わりうる)・開き直したとき・メニュー (表示 > .txt で装飾表示を使う) で切り替えたときに呼ぶ。設定は `settings.toml` の `txt_detail_view`。
+- **表示と座標**: `App::view_line(doc, line)` が `lvt_core::lineview::LineView` を返す (キャレット行ではキャレット位置を渡し、その要素を展開する)。描画 (`paint_text`)・クリック判定 (`hit_view` → `pos_at` / `url_at`)・キャレットの x 座標 (`col_x`、IME の位置) はすべてこれを使い、桁は `to_view` / `to_doc` で変換する。`[label](url)` の label は Ctrl+クリックで url を開く。ブロックキャレットはキャレット位置の文字の幅 (全角など) に合わせる。
+- **バッジ**: 装飾表示のタブでは行番号の欄を 2 文字分広げ、詳細のある行の行番号の右隣 (本文との間) に角丸のバッジ (メモの線 3 本) を描く (`App::badge_x` / `badge_at`)。クリックするとその行の詳細を編集する。
+- **パネルの表示** (`paint_detail_panel`): キャレット行に詳細があれば、内容を本文と同じ装飾 (`decorate_lines`: 行ごとの `LineView` と URL) で折り返して表示する (幅は本文の 40%、260〜540 DIP。高さは本文の半分まで)。はみ出したら細いスクロールバー (`PanelScrollbar`) を出し、ホイールとつまみのドラッグでスクロールする (`App.panel_scroll`、行が変わったら先頭へ)。編集中も同様に、編集用のタブの `scroll_line` を表すスクロールバーを出す。編集用の文書も装飾表示にする。枠は `paint_panel_frame` (角丸の本体と枠線、見出しの帯)。領域は `App.detail_panel` に記録し、クリック判定とカーソルの形に使う。
+- **位置**: `App.panel_pos` (本文の領域に対する割合)。見出しの帯をドラッグすると `Drag::Panel` で動かし、離したら `settings.toml` の `detail_panel_pos` に保存する。動かしていない (設定がない) ときは右上に置き、キャレット行と重なれば右下へ移す。
+- **パネル内の編集** (`panel.rs`): F2 / バッジのクリック / パネルのクリックで `start_detail_edit` → `App.detail_edit = Some(DetailEdit { tab, idx, line, original })`。
+  - 編集中は `App::tab()` / `tab_mut()` が編集用のタブを、`App::geometry()` がパネルの内側の配置 (`edit_geometry`) を返す。そのため、キー入力・入力モード (Vim)・IME・検索・Undo・`:` コマンドなどは、そのまま編集中の文書に働く。本体のスクロールバー・タイトルは `with_main` で本体を対象にして更新する。
+  - 閉じる: Esc (Vim はノーマルモードで、入力途中のキーがないとき)・Ctrl+Enter・F2・パネルの外のクリック・`:q` / `:wq` は反映して閉じる (`finish_detail_edit(true)` → `write_detail` で 1 回の Undo)。`:q!` は破棄、`:w` は反映して編集を続ける。
+  - 本体のファイル・タブ・設定に関わる操作 (保存・タブ切り替え・終了など) の前には、反映して閉じる (`execute_app` と `run_deferred` の先頭)。

@@ -96,9 +96,9 @@ pub enum AppCommand {
     VimSearch { forward: bool },
     /// Vim の `*` / `#`: キャレット位置の単語を検索する。
     SearchWord { forward: bool },
-    /// キャレット行の詳細 (`*[…]`) を編集ウィンドウで編集する (なければ作る)。
+    /// キャレット行の詳細 (`*detail[…]`) をパネルで編集する (編集中なら反映して閉じる)。
     EditDetail,
-    /// .txt で詳細の折りたたみ表示を使うか切り替える (.lvt は常に使う)。
+    /// .txt で装飾表示 (詳細の折りたたみ・記法の装飾) を使うか切り替える (.lvt は常に使う)。
     ToggleTxtDetailView,
 }
 

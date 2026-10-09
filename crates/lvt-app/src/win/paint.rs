@@ -2,6 +2,7 @@
 
 use lvt_core::keymap::CaretStyle;
 use lvt_core::detail;
+use lvt_core::lineview::LineView;
 use lvt_core::link;
 use lvt_core::syntax::{StyleSpan, TokenKind};
 use lvt_core::theme::Theme;
@@ -12,6 +13,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 
 use super::app::{prompt_input_left, status_prompt_text_left, App, Geometry, ImeComposition, Tab, TabHit};
+use super::panel::{PanelRect, PanelScrollbar, PANEL_RADIUS};
 use super::render::Renderer;
 use super::util::{byte_to_utf16, char_to_utf16};
 
@@ -20,6 +22,10 @@ struct TextCtx<'a> {
     caret: CaretStyle,
     matches: Option<&'a Regex>,
     ime: Option<&'a ImeComposition>,
+    /// 行番号の欄を描くか (詳細パネルの中では描かない)。
+    gutter: bool,
+    /// 行番号の欄の詳細のバッジの左右 (`App::badge_x`)。None ならバッジの欄はない。
+    badge_x: Option<(f32, f32)>,
 }
 
 impl App {
@@ -27,19 +33,28 @@ impl App {
         if !self.renderer.begin(self.hwnd) {
             return;
         }
-        let g = self.geometry();
+        let g = self.main_geometry();
         let theme = self.theme.clone();
         self.renderer.clear(theme.background);
 
+        let editing = self.detail_edit.is_some();
+        self.panel_scrollbar = None;
+        let matches = if self.highlight_matches { self.search_re.as_ref() } else { None };
+        // 詳細の編集中は、本体にキャレット・IME・検索の強調を描かない
         let ctx = TextCtx {
-            focused: self.focused,
+            focused: self.focused && !editing,
             caret: self.mode.caret_style(),
-            matches: if self.highlight_matches { self.search_re.as_ref() } else { None },
-            ime: self.ime.as_ref(),
+            matches: matches.filter(|_| !editing),
+            ime: self.ime.as_ref().filter(|_| !editing),
+            gutter: true,
+            badge_x: self.badge_x(&g),
         };
-        let tab = &mut self.tabs[self.active];
-        paint_text(&mut self.renderer, tab, &g, &theme, &ctx);
-        self.paint_detail_panel(&g, &theme);
+        paint_text(&mut self.renderer, &mut self.tabs[self.active], &g, &theme, &ctx);
+        if editing {
+            self.paint_edit_panel(&g, &theme);
+        } else {
+            self.paint_detail_panel(&g, &theme);
+        }
 
         self.paint_tabbar(&g, &theme);
         if self.prompt.as_ref().is_some_and(|p| !p.in_status_bar()) {
@@ -49,7 +64,30 @@ impl App {
         self.renderer.end();
     }
 
-    /// キャレット行の詳細 (`*[…]`) の内容を、本文の右上 (キャレット行と重なるなら右下) に表示する。
+    /// パネルの枠 (角丸・見出しの帯) を描く。
+    fn paint_panel_frame(&mut self, p: &PanelRect, theme: &Theme, title: &str, hint: &str, active: bool) {
+        let r = &mut self.renderer;
+        let rad = PANEL_RADIUS;
+        r.fill_round(p.left, p.top, p.right, p.bottom, rad, theme.chrome_bg, 1.0);
+        // 本文の部分 (見出しの帯の下) を背景色で塗る
+        r.push_clip(p.left, p.header_bottom, p.right, p.bottom);
+        r.fill_round(p.left, p.top, p.right, p.bottom, rad, theme.background, 1.0);
+        r.pop_clip();
+        r.fill(p.left + 1.0, p.header_bottom, p.right - 1.0, p.header_bottom + 1.0, theme.tab_inactive_bg);
+        let border = if active { theme.accent } else { theme.tab_inactive_bg };
+        r.stroke_round(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5, rad, border, if active { 1.5 } else { 1.0 });
+
+        let hh = p.header_bottom - p.top;
+        r.push_clip(p.left + 12.0, p.top, p.right - 12.0, p.header_bottom);
+        let hint_w = r.text_width(hint, &r.ui_format);
+        let tw = r.draw_ui_text(title, p.left + 12.0, p.top, hh, theme.chrome_fg);
+        if p.left + 12.0 + tw + 16.0 + hint_w < p.right - 12.0 {
+            r.draw_ui_text(hint, p.right - 12.0 - hint_w, p.top, hh, theme.gutter_fg);
+        }
+        r.pop_clip();
+    }
+
+    /// キャレット行の詳細 (`*detail[…]`) の内容を表示する。位置は `panel_rect` (既定は右上で、キャレット行を避ける)。
     fn paint_detail_panel(&mut self, g: &Geometry, theme: &Theme) {
         self.detail_panel = None;
         let doc = &self.tabs[self.active].doc;
@@ -59,51 +97,94 @@ impl App {
         let c = token.content();
         let content = detail::unescape(&doc.buffer().slice_to_string(ls + c.start..ls + c.end));
         let scroll_line = self.tabs[self.active].scroll_line;
+        if self.panel_scroll_line != Some(caret_line) {
+            self.panel_scroll = 0.0;
+            self.panel_scroll_line = Some(caret_line);
+        }
 
-        let r = &mut self.renderer;
-        let text_w = g.width - g.text_left;
+        let text_w = g.width - g.gutter_w;
         let text_h = g.text_bottom - g.text_top;
-        if text_w < 260.0 || text_h < 120.0 {
+        if text_w < 280.0 || text_h < 140.0 {
             return;
         }
-        let pad = 10.0;
-        let w = (text_w * 0.4).clamp(240.0, 520.0);
-        let inner_w = w - pad * 2.0;
-        let header_h = r.ui_line_height + 6.0;
+        let pad = 14.0;
+        let w = (text_w * 0.4).clamp(260.0, 540.0);
+        let header_h = self.panel_header_h();
         let empty = content.is_empty();
-        let shown = if empty { "(空です。F2 で編集)".to_string() } else { content };
-        let Some(layout) = r.layout_str(&shown, &r.text_format.clone()) else { return };
+        // 本文と同じ装飾 (リンク・コード・強調) を行ごとに適用する
+        let (shown, spans) = if empty {
+            ("(空です。クリックまたは F2 で編集)".to_string(), Vec::new())
+        } else {
+            decorate_lines(&content)
+        };
+        let format = self.renderer.text_format.clone();
+        let Some(layout) = self.renderer.layout_str(&shown, &format) else { return };
+        apply_styles(&mut self.renderer, &layout, &shown, &spans, theme);
         let mut m = DWRITE_TEXT_METRICS::default();
         unsafe {
             let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-            let _ = layout.SetMaxWidth(inner_w);
+            let _ = layout.SetMaxWidth(w - pad * 2.0 - 8.0);
             let _ = layout.GetMetrics(&mut m);
         }
+        let r = &self.renderer;
         let max_body = (text_h * 0.5 - header_h - pad * 2.0).max(r.line_height);
         let body_h = m.height.min(max_body);
-        let h = pad + header_h + body_h + pad;
-        let x = g.width - w - 12.0;
-        // キャレット行と重なるなら下へ寄せる
+        let h = header_h + pad + body_h + pad;
         let caret_y = g.text_top + (caret_line as f32 - scroll_line as f32) * r.line_height;
-        let mut y = g.text_top + 8.0;
-        if caret_y < y + h && caret_y + r.line_height > y {
-            y = g.text_bottom - h - 8.0;
-        }
+        let p = self.panel_rect(g, w, h, Some((caret_y, caret_y + r.line_height)));
 
-        r.fill(x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0, theme.accent);
-        r.fill(x, y, x + w, y + h, theme.chrome_bg);
-        let title = format!("{} 詳細  (F2 / クリックで編集)", detail::ICON);
-        r.push_clip(x, y, x + w, y + h);
-        r.draw_ui_text(&title, x + pad, y + pad * 0.5, header_h, theme.gutter_fg);
-        let body_top = y + pad + header_h;
-        r.push_clip(x + pad, body_top, x + w - pad, body_top + body_h);
-        r.draw_layout(&layout, x + pad, body_top, if empty { theme.gutter_fg } else { theme.foreground });
+        let title = format!("詳細 · {} 行目", caret_line + 1);
+        self.paint_panel_frame(&p, theme, &title, "クリック / F2 で編集", false);
+        let max_scroll = (m.height - body_h).max(0.0);
+        self.panel_scroll = self.panel_scroll.clamp(0.0, max_scroll);
+        let body_top = p.header_bottom + pad;
+        let r = &mut self.renderer;
+        r.push_clip(p.left + pad, body_top, p.right - pad, body_top + body_h);
+        r.draw_layout(&layout, p.left + pad, body_top - self.panel_scroll, if empty { theme.gutter_fg } else { theme.foreground });
         r.pop_clip();
-        if m.height > body_h {
-            r.draw_ui_text("…", x + w - pad - 12.0, y + h - pad - r.ui_line_height, r.ui_line_height, theme.gutter_fg);
+        if max_scroll > 0.0 {
+            let sb = PanelScrollbar::new(p.right - 9.0, body_top, body_top + body_h, body_h / m.height, self.panel_scroll, max_scroll);
+            self.paint_panel_scrollbar(&sb, theme);
         }
-        r.pop_clip();
-        self.detail_panel = Some((x, y, x + w, y + h));
+        self.detail_panel = Some(p);
+    }
+
+    /// パネル内で編集中の詳細を描く (本体と同じ `paint_text` を使う)。
+    fn paint_edit_panel(&mut self, g: &Geometry, theme: &Theme) {
+        let p = self.edit_panel_rect(g);
+        let line = self.detail_edit.as_ref().map_or(0, |e| e.line);
+        let hint = if self.vim_enabled { "Esc: 反映して閉じる   :q!: 破棄" } else { "Esc / Ctrl+Enter: 反映して閉じる" };
+        let title = format!("詳細を編集 · {} 行目", line + 1);
+        self.paint_panel_frame(&p, theme, &title, hint, true);
+        let eg = self.edit_geometry(*g);
+        let ctx = TextCtx {
+            focused: self.focused,
+            caret: self.mode.caret_style(),
+            matches: if self.highlight_matches { self.search_re.as_ref() } else { None },
+            ime: self.ime.as_ref(),
+            gutter: false,
+            badge_x: None,
+        };
+        let vis = self.visible_lines();
+        if let Some(e) = &mut self.detail_edit {
+            paint_text(&mut self.renderer, &mut e.tab, &eg, theme, &ctx);
+            let lines = e.tab.doc.buffer().len_lines();
+            if lines > vis {
+                let max = (lines - vis) as f32;
+                let ratio = vis as f32 / lines as f32;
+                let sb = PanelScrollbar::new(p.right - 9.0, eg.text_top, eg.text_bottom, ratio, e.tab.scroll_line as f32, max);
+                self.paint_panel_scrollbar(&sb, theme);
+            }
+        }
+        self.detail_panel = Some(p);
+    }
+
+    /// パネルの細いスクロールバー (角丸のトラックとつまみ)。
+    fn paint_panel_scrollbar(&mut self, sb: &PanelScrollbar, theme: &Theme) {
+        let r = &mut self.renderer;
+        r.fill_round(sb.left, sb.top, sb.right, sb.bottom, 2.0, theme.gutter_fg, 0.15);
+        r.fill_round(sb.left, sb.thumb_top, sb.right, sb.thumb_top + sb.thumb_h, 2.0, theme.gutter_fg, 0.6);
+        self.panel_scrollbar = Some(*sb);
     }
 
     fn paint_tabbar(&mut self, g: &Geometry, theme: &Theme) {
@@ -173,9 +254,11 @@ impl App {
     }
 
     fn paint_status(&mut self, g: &Geometry, theme: &Theme) {
+        // 行・桁と選択は操作対象 (詳細の編集中はパネル)、文字コードなどは本体
         let doc = &self.tabs[self.active].doc;
-        let sel = doc.selection();
-        let (line, col) = doc.buffer().line_col(doc.caret_pos());
+        let cur = &self.tab().doc;
+        let sel = cur.selection();
+        let (line, col) = cur.buffer().line_col(cur.caret_pos());
         let left = self.status.clone().unwrap_or_else(|| {
             let mut s = format!("{} 行, {} 桁", line + 1, col + 1);
             if !sel.is_empty() {
@@ -224,6 +307,7 @@ impl App {
 }
 
 fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx: &TextCtx) {
+    let badge_x = ctx.badge_x;
     let lh = r.line_height;
     let cw = r.char_width;
     let sel = tab.doc.selection();
@@ -234,7 +318,9 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
     let format = r.text_format.clone();
     let mut spans: Vec<StyleSpan> = Vec::new();
 
-    r.fill(0.0, g.text_top, g.gutter_w, g.text_bottom, theme.gutter_bg);
+    if ctx.gutter {
+        r.fill(0.0, g.text_top, g.gutter_w, g.text_bottom, theme.gutter_bg);
+    }
     r.push_clip(g.gutter_w, g.text_top, g.width, g.text_bottom);
     for i in 0..rows {
         let line = tab.scroll_line + i;
@@ -244,10 +330,11 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         let y = g.text_top + i as f32 * lh;
         let line_start = tab.doc.buffer().line_to_char(line);
         let line_len = tab.doc.buffer().line_len(line);
-        // 表示用の行 (行頭の詳細 `*[…]` はアイコン 1 文字に折りたたむ)。
+        // 表示用の行 (装飾表示では詳細をアイコンにし、記法の記号を隠す)。
         // 文書上の桁 → 表示上の桁は `vcol` で変換する。
-        let (text, token) = App::view_line(&tab.doc, line);
-        let vcol = |col: usize| token.map_or(col, |t| t.to_view(col, false));
+        let view = App::view_line(&tab.doc, line);
+        let text = view.text.clone();
+        let vcol = |col: usize| view.to_view(col, false);
         let caret_vcol = vcol(caret_col);
         // IME で変換中の文字列はキャレット位置に埋め込んで描く。
         // 表示用の行の位置 (UTF-16) → 変換中の文字列を含めた位置は `to_view` で変換する。
@@ -272,6 +359,11 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
         spans.clear();
         tab.doc.highlight_line(line, &view_text, &mut spans);
         spans.extend(link::find_urls(&view_text).into_iter().map(|range| StyleSpan { range, kind: TokenKind::Link }));
+        // 装飾表示の書式 (リンク・コード・強調)。IME の文字列を挿入した場合は位置をずらす
+        let ime_byte = ime.map(|_| text.char_indices().nth(caret_vcol).map_or(text.len(), |(b, _)| b));
+        let ime_bytes = ime.map_or(0, |c| c.text.len());
+        let shift = |b: usize| if ime_byte.is_some_and(|at| b >= at) { b + ime_bytes } else { b };
+        spans.extend(view.styles.iter().map(|s| StyleSpan { range: shift(s.range.start)..shift(s.range.end), kind: s.kind }));
         apply_styles(r, &layout, &view_text, &spans, theme);
         if ime.is_some() {
             let range = DWRITE_TEXT_RANGE { startPosition: ime_at as u32, length: ime_len as u32 };
@@ -333,14 +425,27 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
     r.pop_clip();
 
     // 行番号
-    for i in 0..rows {
+    for i in (0..rows).filter(|_| ctx.gutter) {
         let line = tab.scroll_line + i;
         if line >= len_lines {
             break;
         }
         let y = g.text_top + i as f32 * lh;
+        // 詳細のある行: 行番号の右隣にバッジ (角丸の地にメモの線 3 本)
+        if let Some((bx0, bx1)) = badge_x.filter(|_| tab.doc.detail_at_line(line).is_some()) {
+            let bh = (lh * 0.62).max(10.0);
+            let by = y + (lh - bh) / 2.0;
+            r.fill_round(bx0, by, bx1, by + bh, 3.0, theme.accent, 0.9);
+            for (k, frac) in [(0.3, 1.0), (0.5, 1.0), (0.7, 0.6)] {
+                let ly = by + bh * k;
+                let lx1 = bx0 + 3.0 + (bx1 - bx0 - 6.0) * frac;
+                r.fill(bx0 + 3.0, ly - 0.6, lx1, ly + 0.6, theme.background);
+            }
+        }
         let num = (line + 1).to_string();
-        let x = g.gutter_w - cw * (num.len() as f32 + 1.0);
+        // 行番号は右寄せ。バッジの欄があればその左に寄せる
+        let num_right = badge_x.map_or(g.gutter_w - cw, |(bx0, _)| bx0 - cw * 0.5);
+        let x = num_right - cw * num.len() as f32;
         let color = if line == caret_line { theme.gutter_current_fg } else { theme.gutter_fg };
         if let Some(layout) = r.layout_str(&num, &format) {
             unsafe {
@@ -350,6 +455,23 @@ fn paint_text(r: &mut Renderer, tab: &mut Tab, g: &Geometry, theme: &Theme, ctx:
             r.draw_layout(&layout, x, y, color);
         }
     }
+}
+
+/// 複数行の文字列を装飾表示にする (行ごとに `LineView`、URL も検出)。表示用の文字列と書式を返す。
+fn decorate_lines(content: &str) -> (String, Vec<StyleSpan>) {
+    let mut text = String::with_capacity(content.len());
+    let mut spans = Vec::new();
+    for (i, line) in content.split('\n').enumerate() {
+        if i > 0 {
+            text.push('\n');
+        }
+        let v = LineView::build(line, None);
+        let off = text.len();
+        spans.extend(v.styles.iter().map(|s| StyleSpan { range: s.range.start + off..s.range.end + off, kind: s.kind }));
+        text.push_str(&v.text);
+    }
+    spans.extend(link::find_urls(&text).into_iter().map(|range| StyleSpan { range, kind: TokenKind::Link }));
+    (text, spans)
 }
 
 /// ハイライト結果をテキストレイアウトの書式として適用する。

@@ -67,7 +67,7 @@ pub struct Ctx<'a> {
     pub view: &'a ViewInfo,
     /// 現在維持している表示桁。
     pub pref: Option<usize>,
-    /// 詳細 (`*[…]`) を折りたたんで表示しているか (表示桁の数え方が変わる)。
+    /// 装飾表示か (詳細の折りたたみや記号の非表示で、表示桁の数え方が変わる)。
     pub detail_view: bool,
 }
 
@@ -126,7 +126,7 @@ pub fn target(ctx: &Ctx, pos: usize, motion: VimMotion, count: Option<usize>) ->
         M::FirstNonBlank => first_nonblank(buf, line),
         M::LineEnd => {
             let l = (line + n - 1).min(last_line);
-            return Some(Jump { pos: last_char(buf, l), pref: Some(usize::MAX) });
+            return Some(Jump { pos: last_visible_char(buf, l, ctx.detail_view), pref: Some(usize::MAX) });
         }
         M::GotoLine { last } => match count {
             Some(c) => to_line(c.max(1) - 1),
@@ -184,6 +184,15 @@ pub fn last_char(buf: &TextBuffer, line: usize) -> usize {
         end - 1
     } else {
         end
+    }
+}
+
+/// 行の最後の見える文字。装飾表示で行末に詳細 (見えない) があるときは、その手前の文字。
+pub fn last_visible_char(buf: &TextBuffer, line: usize, detail_view: bool) -> usize {
+    let ls = buf.line_to_char(line);
+    match detail_view.then(|| crate::detail::find_in_line(buf, line)).flatten() {
+        Some(t) if ls + t.end == buf.line_end(line) => ls + t.start.saturating_sub(1),
+        _ => last_char(buf, line),
     }
 }
 

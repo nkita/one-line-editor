@@ -11,7 +11,8 @@ use lvt_core::editor::{self, EditorConfig, ViewInfo};
 use lvt_core::encoding::{SaveError, TextEncoding};
 use lvt_core::history::MergeKind;
 use lvt_core::keymap::{InputMode, Key, KeyChord, Keymap, ModeResponse, StandardMode};
-use lvt_core::detail::{self, Token};
+use lvt_core::detail;
+use lvt_core::lineview::LineView;
 use lvt_core::link;
 use lvt_core::settings::Settings;
 use lvt_core::vim::{self, ex, Register, VimEdit, VimMode};
@@ -32,11 +33,12 @@ use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, GetClientRect, GetCursorPos, GetScrollInfo, SetMenu, WindowFromPoint, KillTimer, LoadCursorW, SetCursor, SetTimer, SetWindowTextW, IDC_ARROW,
-    IDC_HAND, IDC_IBEAM, IDC_WAIT, SB_HORZ, SB_VERT, SCROLLBAR_CONSTANTS, SCROLLINFO, SIF_ALL, SIF_DISABLENOSCROLL, SIF_TRACKPOS,
+    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, SB_HORZ, SB_VERT, SCROLLBAR_CONSTANTS, SCROLLINFO, SIF_ALL, SIF_DISABLENOSCROLL, SIF_TRACKPOS,
 };
 
 use super::input;
 use super::menu::Menus;
+use super::panel::{DetailEdit, PanelRect, PanelScrollbar};
 use super::prompt::{Prompt, PromptKind};
 use super::render::{Renderer, DEFAULT_FONT_SIZE};
 use super::util::{char_to_utf16, utf16_to_char, wide};
@@ -56,7 +58,7 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn new(doc: Document) -> Self {
+    pub fn new(doc: Document) -> Self {
         Self { doc, scroll_line: 0, scroll_x: 0.0, max_width: 0.0 }
     }
 }
@@ -73,8 +75,6 @@ pub enum Deferred {
     OpenUrl(String),
     /// Vim の :q / :q! / :wq。最後のタブなら終了する。
     Quit { idx: usize, save: bool, force: bool },
-    /// 詳細 (`*[…]`) の編集ウィンドウを開く。
-    EditDetail { idx: usize, line: usize },
 }
 
 /// IME で変換中の文字列。本文のキャレット位置に埋め込んで描画する。
@@ -110,10 +110,7 @@ struct ViewHit {
     line: usize,
     /// 表示用の行の文字位置。
     vcol: usize,
-    text: String,
-    token: Option<Token>,
-    /// 詳細のアイコンの上か。
-    on_icon: bool,
+    view: LineView,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +126,10 @@ enum Drag {
     Lines { anchor_line: usize },
     /// タブの並べ替え。`moved` はしきい値を超えて動かしたか。
     Tab { idx: usize, start_x: f32, moved: bool },
+    /// 詳細パネルの移動 (`ox`, `oy` はパネルの左上からのマウスの位置)。
+    Panel { ox: f32, oy: f32 },
+    /// 詳細パネルのスクロールバーのつまみ (`grab` はつまみの上端からのマウスの位置)。
+    PanelScroll { grab: f32 },
 }
 
 /// タブのドラッグを開始とみなす移動量 (DIP)。
@@ -165,14 +166,23 @@ pub struct App {
     register: Option<Register>,
     /// 直前の入力の時点でノーマルモードだったか (ノーマルモードに戻ったら IME を閉じる)。
     was_normal: bool,
-    settings: Settings,
+    pub(super) settings: Settings,
     settings_path: Option<PathBuf>,
     /// 入力欄の処理 (`:w` など) から返す `Deferred`。
     pending_deferred: Option<Deferred>,
     /// .txt で詳細の折りたたみ表示を使うか (.lvt は常に使う)。
     pub txt_detail_view: bool,
-    /// 詳細パネルの領域 (left, top, right, bottom)。表示していなければ None (paint.rs が更新する)。
-    pub detail_panel: Option<(f32, f32, f32, f32)>,
+    /// 詳細パネルの領域。表示していなければ None (paint.rs が描画のたびに更新する)。
+    pub detail_panel: Option<PanelRect>,
+    /// パネル内で編集中の詳細。
+    pub detail_edit: Option<DetailEdit>,
+    /// パネルの位置 (本文の領域に対する割合。0,0 = 左上、1,0 = 右上)。None なら右上でキャレット行を避ける。
+    pub panel_pos: Option<(f32, f32)>,
+    /// 表示中のパネルの縦スクロール量 (DIP) と、その対象の行 (行が変わったら先頭に戻す)。
+    pub panel_scroll: f32,
+    pub panel_scroll_line: Option<usize>,
+    /// パネルのスクロールバー (スクロールできるときだけ。paint.rs が更新する)。
+    pub panel_scrollbar: Option<PanelScrollbar>,
 }
 
 /// Vim キーバインドを使うか。設定がなければ Vim を既定にする。
@@ -204,6 +214,10 @@ impl App {
     ) -> Result<Self> {
         let vim_enabled = vim_by_default(&settings);
         let txt_detail_view = settings.get("txt_detail_view") != Some("false");
+        let panel_pos = settings.get("detail_panel_pos").and_then(|v| {
+            let (x, y) = v.split_once(',')?;
+            Some((x.trim().parse::<f32>().ok()?.clamp(0.0, 1.0), y.trim().parse::<f32>().ok()?.clamp(0.0, 1.0)))
+        });
         let editor_cfg = EditorConfig::default();
         let renderer = Renderer::new(hwnd, editor_cfg.tab_width)?;
         Ok(Self {
@@ -238,15 +252,40 @@ impl App {
             pending_deferred: None,
             txt_detail_view,
             detail_panel: None,
+            detail_edit: None,
+            panel_pos,
+            panel_scroll: 0.0,
+            panel_scroll_line: None,
+            panel_scrollbar: None,
         })
     }
 
+    /// 操作対象のタブ。詳細をパネルで編集中は、その編集用のタブ。
     pub fn tab(&self) -> &Tab {
-        &self.tabs[self.active]
+        match &self.detail_edit {
+            Some(e) => &e.tab,
+            None => &self.tabs[self.active],
+        }
     }
 
     pub fn tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active]
+        match &mut self.detail_edit {
+            Some(e) => &mut e.tab,
+            None => &mut self.tabs[self.active],
+        }
+    }
+
+    /// 表示中のタブ (詳細の編集中でも本体)。
+    pub fn main_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    /// 詳細の編集中に、一時的に本体を操作対象にして `f` を実行する (スクロールバーなど)。
+    fn with_main<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let edit = self.detail_edit.take();
+        let r = f(self);
+        self.detail_edit = edit;
+        r
     }
 
     fn doc(&self) -> &Document {
@@ -259,7 +298,18 @@ impl App {
 
     // ---- 画面配置 ----
 
+    /// 操作対象の本文の配置。詳細をパネルで編集中はパネルの内側。
     pub fn geometry(&self) -> Geometry {
+        let g = self.main_geometry();
+        if self.detail_edit.is_some() {
+            self.edit_geometry(g)
+        } else {
+            g
+        }
+    }
+
+    /// 本体の画面配置。
+    pub fn main_geometry(&self) -> Geometry {
         let mut rc = RECT::default();
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut rc);
@@ -274,8 +324,10 @@ impl App {
         let prompt_h = if prompt_bar { r.snap(r.line_height.max(r.ui_line_height) + 12.0) } else { 0.0 };
         let status_top = (height - status_h).max(tabbar_h);
         let prompt_top = (status_top - prompt_h).max(tabbar_h);
-        let digits = self.doc().buffer().len_lines().to_string().len().max(3);
-        let gutter_w = r.snap((digits as f32 + 2.0) * r.char_width);
+        let digits = self.main_tab().doc.buffer().len_lines().to_string().len().max(3);
+        // 装飾表示では、行番号の右隣に詳細のバッジの欄を設ける
+        let badge = if self.main_tab().doc.detail_view() { 2.0 } else { 0.0 };
+        let gutter_w = r.snap((digits as f32 + 2.0 + badge) * r.char_width);
         Geometry {
             width,
             height,
@@ -301,21 +353,22 @@ impl App {
         s.slice(..n).to_string()
     }
 
-    /// 表示用の行の文字列と、その行の詳細。詳細はアイコン 1 文字に折りたたむ。
-    pub fn view_line(doc: &Document, line: usize) -> (String, Option<Token>) {
-        let Some(t) = doc.detail_at_line(line) else { return (Self::line_text(doc, line), None) };
-        let s = doc.buffer().line(line);
-        let tail_end = s.len_chars().min(t.end + MAX_RENDER_CHARS);
-        let mut v = s.slice(..t.start).to_string();
-        v.push(detail::ICON);
-        v.push_str(&s.slice(t.end..tail_end).to_string());
-        (v, Some(t))
+    /// 表示用の行。装飾表示 (.txt / .lvt) では詳細をアイコンにし、記法の記号を隠す
+    /// (キャレットのある要素だけは記法のまま)。
+    pub fn view_line(doc: &Document, line: usize) -> LineView {
+        let text = Self::line_text(doc, line);
+        if !doc.detail_view() {
+            return LineView::plain(&text);
+        }
+        let (caret_line, caret_col) = doc.buffer().line_col(doc.caret_pos());
+        LineView::build(&text, (caret_line == line).then_some(caret_col))
     }
 
     /// 行内の文字位置の x 座標 (行頭からの DIP)。
     fn col_x(&self, line: usize, col: usize) -> f32 {
-        let (text, token) = Self::view_line(self.doc(), line);
-        let vcol = token.map_or(col, |t| t.to_view(col, false));
+        let view = Self::view_line(self.doc(), line);
+        let vcol = view.to_view(col, false);
+        let text = view.text;
         let u: Vec<u16> = text.encode_utf16().collect();
         match self.renderer.layout(&u, &self.renderer.text_format) {
             Some(l) => Renderer::x_of(&l, char_to_utf16(&text, vcol)),
@@ -339,7 +392,7 @@ impl App {
         }
     }
 
-    /// 詳細の編集ウィンドウに渡す文字列 (行に詳細がなければ空)。
+    /// 詳細の内容 (エスケープを戻したもの。行に詳細がなければ空)。
     pub fn detail_text(&self, idx: usize, line: usize) -> Option<String> {
         let doc = &self.tabs.get(idx)?.doc;
         let Some(t) = doc.detail_at_line(line) else { return Some(String::new()) };
@@ -348,7 +401,7 @@ impl App {
         Some(detail::unescape(&doc.buffer().slice_to_string(ls + c.start..ls + c.end)))
     }
 
-    /// 編集ウィンドウで確定した文字列を書き戻す (1 回の Undo で戻せる)。行に詳細がなければ行頭に作る。
+    /// 編集した文字列を書き戻す (1 回の Undo で戻せる)。行に詳細がなければ行末に作る。
     pub fn write_detail(&mut self, idx: usize, line: usize, text: &str) {
         let Some(tab) = self.tabs.get_mut(idx) else { return };
         let doc = &mut tab.doc;
@@ -370,11 +423,12 @@ impl App {
             None if text.is_empty() => return,
             None => {
                 let line_text = doc.buffer().line(line);
-                let indent = line_text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
-                let sep = if line_text.len_chars() > indent { " " } else { "" };
-                let at = ls + indent;
-                let end = at + n + 3;
-                doc.apply(vec![(at..at, format!("*[{escaped}]{sep}"))], MergeKind::None, |_, _| Selection::caret(end));
+                let len = line_text.len_chars();
+                let sep = if len > 0 && !matches!(line_text.char(len - 1), ' ' | '\t') { " " } else { "" };
+                let at = ls + len;
+                let caret = doc.selection().head;
+                let token = format!("{sep}{}{escaped}]", detail::PREFIX);
+                doc.apply(vec![(at..at, token)], MergeKind::None, |_, _| Selection::caret(caret));
             }
         }
         doc.end_undo_group();
@@ -389,10 +443,24 @@ impl App {
 
     /// 状態変更後の共通処理: スクロールバー・タイトル更新と再描画。
     pub fn refresh(&mut self) {
-        self.clamp_scroll();
-        self.update_scrollbars();
-        self.update_title();
+        if self.detail_edit.is_some() {
+            self.clamp_scroll();
+        }
+        // スクロールバーとタイトルは常に本体を表す
+        self.with_main(|a| {
+            a.clamp_scroll();
+            a.update_scrollbars();
+            a.update_title();
+        });
         self.invalidate();
+    }
+
+    pub(super) fn save_settings(&mut self) {
+        if let Some(path) = &self.settings_path {
+            if let Err(e) = self.settings.save(path) {
+                self.status = Some(format!("設定を保存できませんでした: {e}"));
+            }
+        }
     }
 
     pub fn invalidate(&self) {
@@ -573,6 +641,7 @@ impl App {
 
     /// Vim キーバインドの有効・無効を切り替え、設定に保存する。
     fn set_vim(&mut self, on: bool) {
+        self.finish_detail_edit(true);
         for t in &mut self.tabs {
             t.doc.end_undo_group();
             vim::leave_visual(&mut t.doc);
@@ -590,15 +659,32 @@ impl App {
         }
         self.settings.set("input_mode", if on { "vim" } else { "standard" });
         self.status = Some(if on { "Vim キーバインド: オン" } else { "Vim キーバインド: オフ" }.into());
-        if let Some(path) = &self.settings_path {
-            if let Err(e) = self.settings.save(path) {
-                self.status = Some(format!("設定を保存できませんでした: {e}"));
-            }
-        }
+        self.save_settings();
     }
 
     fn execute_app(&mut self, cmd: AppCommand) -> Option<Deferred> {
         use AppCommand as A;
+        // 本体のファイル・タブ・設定に関わる操作の前に、編集中の詳細を反映して閉じる
+        if self.detail_edit.is_some()
+            && matches!(
+                cmd,
+                A::NewTab
+                    | A::Open
+                    | A::Save
+                    | A::SaveAs
+                    | A::CloseTab
+                    | A::Exit
+                    | A::NextTab
+                    | A::PrevTab
+                    | A::MoveTab(_)
+                    | A::ReopenWithEncoding(_)
+                    | A::SetSaveEncoding(_)
+                    | A::SetLineEnding(_)
+                    | A::ToggleTxtDetailView
+            )
+        {
+            self.finish_detail_edit(true);
+        }
         match cmd {
             A::NewTab => {
                 self.tabs.push(Tab::new(Document::new()));
@@ -672,32 +758,28 @@ impl App {
             }
             A::SearchWord { forward } => self.search_word(forward),
             A::EditDetail => {
-                if !self.doc().detail_view() {
-                    self.status = Some(if self.txt_detail_view {
-                        "詳細 (*[…]) は .txt / .lvt ファイルで使えます"
-                    } else {
-                        "詳細 (*[…]) は .lvt ファイルで使えます (.txt は表示メニューで有効にできます)"
-                    }
-                    .into());
-                    return None;
+                if self.detail_edit.is_some() {
+                    self.finish_detail_edit(true);
+                } else {
+                    let doc = &self.main_tab().doc;
+                    let line = doc.buffer().char_to_line(doc.caret_pos());
+                    self.start_detail_edit(line);
                 }
-                let line = self.doc().buffer().char_to_line(self.doc().caret_pos());
-                return Some(Deferred::EditDetail { idx: self.active, line });
             }
             A::ToggleTxtDetailView => {
                 self.txt_detail_view = !self.txt_detail_view;
                 self.update_detail_views();
                 self.settings.set("txt_detail_view", if self.txt_detail_view { "true" } else { "false" });
-                self.status = Some(format!(".txt の詳細ビュー: {}", if self.txt_detail_view { "オン" } else { "オフ" }));
-                if let Some(path) = &self.settings_path {
-                    if let Err(e) = self.settings.save(path) {
-                        self.status = Some(format!("設定を保存できませんでした: {e}"));
-                    }
-                }
+                self.status = Some(format!(".txt の装飾表示: {}", if self.txt_detail_view { "オン" } else { "オフ" }));
+                self.save_settings();
             }
             A::Cancel => {
                 if self.prompt.take().is_none() {
-                    self.highlight_matches = false;
+                    if self.detail_edit.is_some() {
+                        self.finish_detail_edit(true);
+                    } else {
+                        self.highlight_matches = false;
+                    }
                 }
             }
         }
@@ -705,6 +787,9 @@ impl App {
     }
 
     pub fn activate(&mut self, idx: usize) {
+        if idx != self.active {
+            self.finish_detail_edit(true);
+        }
         if idx < self.tabs.len() {
             if idx != self.active {
                 let doc = self.doc_mut();
@@ -766,6 +851,7 @@ impl App {
 
     /// ファイルを開く。エラーメッセージの一覧を返す。
     pub fn open_paths(&mut self, paths: Vec<PathBuf>) -> Vec<String> {
+        self.finish_detail_edit(true);
         let mut errors = Vec::new();
         for path in paths {
             let path = std::path::absolute(&path).unwrap_or(path);
@@ -809,6 +895,7 @@ impl App {
     }
 
     pub fn remove_tab(&mut self, idx: usize) {
+        self.finish_detail_edit(true);
         if idx >= self.tabs.len() {
             return;
         }
@@ -1065,6 +1152,10 @@ impl App {
         let current = buf.char_to_line(self.doc().caret_pos());
         let n = buf.len_lines();
         match cmd {
+            // 詳細の編集中: :w で反映、:q / :wq で反映して閉じる、:q! で破棄して閉じる
+            ex::ExCommand::Write if self.detail_edit.is_some() => self.write_detail_edit(),
+            ex::ExCommand::Quit { force } if self.detail_edit.is_some() => self.finish_detail_edit(!force),
+            ex::ExCommand::WriteQuit if self.detail_edit.is_some() => self.finish_detail_edit(true),
             ex::ExCommand::Write => self.pending_deferred = Some(Deferred::Save(idx)),
             ex::ExCommand::Quit { force } => self.pending_deferred = Some(Deferred::Quit { idx, save: false, force }),
             ex::ExCommand::WriteQuit => self.pending_deferred = Some(Deferred::Quit { idx, save: true, force: false }),
@@ -1188,6 +1279,11 @@ impl App {
         let Some(key) = input::key_from_vk(vk) else { return KeyOutcome::Unhandled };
         let mods = input::current_modifiers();
         let chord = KeyChord::new(key, mods);
+        // 詳細の編集中: Ctrl+Enter で反映して閉じる
+        if self.detail_edit.is_some() && self.prompt.is_none() && key == Key::Enter && mods.ctrl && !mods.alt {
+            self.finish_detail_edit(true);
+            return KeyOutcome::Handled(None);
+        }
         if self.prompt.is_some() && self.prompt_key(chord) {
             self.suppress_syschar = mods.alt;
             if self.prompt.is_none() {
@@ -1255,28 +1351,21 @@ impl App {
     /// 画面座標 (DIP) → 文字位置。
     fn pos_at(&self, g: &Geometry, x: f32, y: f32) -> usize {
         let hit = self.hit_view(g, x, y);
-        let col = hit.token.map_or(hit.vcol, |t| t.to_doc(hit.vcol));
-        self.doc().buffer().line_to_char(hit.line) + col
+        self.doc().buffer().line_to_char(hit.line) + hit.view.to_doc(hit.vcol)
     }
 
     /// 画面座標 (DIP) にある、表示用の行の文字位置。
     fn hit_view(&self, g: &Geometry, x: f32, y: f32) -> ViewHit {
         let line = self.line_at_y(g, y);
-        let (text, token) = Self::view_line(self.doc(), line);
+        let view = Self::view_line(self.doc(), line);
+        let text = &view.text;
         let u: Vec<u16> = text.encode_utf16().collect();
         let tx = (x - g.text_left + self.tab().scroll_x).max(0.0);
-        let (vcol, icon) = match self.renderer.layout(&u, &self.renderer.text_format) {
-            Some(l) => {
-                let icon = token.map(|t| {
-                    let p = char_to_utf16(&text, t.start);
-                    (Renderer::x_of(&l, p), Renderer::x_of(&l, p + detail::ICON.len_utf16()))
-                });
-                let on_icon = icon.is_some_and(|(x0, x1)| tx >= x0 && tx < x1);
-                (utf16_to_char(&text, Renderer::pos_at(&l, tx)), on_icon)
-            }
-            None => (0, false),
+        let vcol = match self.renderer.layout(&u, &self.renderer.text_format) {
+            Some(l) => utf16_to_char(text, Renderer::pos_at(&l, tx)),
+            None => 0,
         };
-        ViewHit { line, vcol, text, token, on_icon: icon }
+        ViewHit { line, vcol, view }
     }
 
     /// 画面座標 (DIP) にある URL (Ctrl+クリックで開く対象)。
@@ -1285,8 +1374,13 @@ impl App {
             return None;
         }
         let hit = self.hit_view(g, x, y);
-        let byte = hit.text.char_indices().nth(hit.vcol).map(|(b, _)| b)?;
-        link::url_at(&hit.text, byte).map(|r| link::normalize(&hit.text[r]))
+        let text = &hit.view.text;
+        let byte = text.char_indices().nth(hit.vcol).map(|(b, _)| b)?;
+        // [label](url) の label、または URL そのもの
+        if let Some((_, url)) = hit.view.links.iter().find(|(r, _)| r.start <= byte && byte < r.end) {
+            return Some(link::normalize(url));
+        }
+        link::url_at(text, byte).map(|r| link::normalize(&text[r]))
     }
 
     fn select_lines(&mut self, a: usize, b: usize) {
@@ -1300,23 +1394,44 @@ impl App {
 
     pub fn on_mouse_down(&mut self, x: i32, y: i32, double: bool) -> Option<Deferred> {
         let (x, y) = self.to_dip(x, y);
-        let g = self.geometry();
         self.status = None;
+        if let Some(sb) = self.panel_scrollbar.filter(|sb| sb.hit(x, y)) {
+            let grab = if y >= sb.thumb_top && y < sb.thumb_top + sb.thumb_h { y - sb.thumb_top } else { sb.thumb_h / 2.0 };
+            self.drag = Some(Drag::PanelScroll { grab });
+            unsafe { SetCapture(self.hwnd) };
+            self.scroll_panel_to_mouse(y, grab);
+            return None;
+        }
+        if let Some(p) = self.detail_panel {
+            // 見出しの帯: ドラッグでパネルを動かす
+            if p.in_header(x, y) {
+                self.drag = Some(Drag::Panel { ox: x - p.left, oy: y - p.top });
+                unsafe { SetCapture(self.hwnd) };
+                return None;
+            }
+            // 表示中のパネルのクリック: 編集を始める
+            if p.contains(x, y) && self.detail_edit.is_none() {
+                let doc = &self.main_tab().doc;
+                let line = doc.buffer().char_to_line(doc.caret_pos());
+                self.start_detail_edit(line);
+                return None;
+            }
+            // 編集中にパネルの外をクリック: 反映して閉じ、そのクリックを本体で処理する
+            if !p.contains(x, y) && self.detail_edit.is_some() {
+                self.finish_detail_edit(true);
+            }
+        }
+        let g = self.geometry();
         if y < g.tabbar_h {
             return self.tab_click(x, false);
         }
         if y < g.text_top || y >= g.text_bottom {
             return None;
         }
-        if self.in_detail_panel(x, y) {
-            let line = self.doc().buffer().char_to_line(self.doc().caret_pos());
-            return Some(Deferred::EditDetail { idx: self.active, line });
-        }
-        if double && x >= g.text_left {
-            let hit = self.hit_view(&g, x, y);
-            if hit.on_icon {
-                return Some(Deferred::EditDetail { idx: self.active, line: hit.line });
-            }
+        // 行番号の欄の詳細のバッジ: 詳細を編集する
+        if let Some(line) = self.badge_at(&g, x, y) {
+            self.start_detail_edit(line);
+            return None;
         }
         let mods = input::current_modifiers();
         if mods.ctrl && !mods.shift && !double {
@@ -1359,6 +1474,8 @@ impl App {
         match self.drag {
             None => return,
             Some(Drag::Tab { idx, start_x, moved }) => return self.drag_tab(idx, start_x, moved),
+            Some(Drag::Panel { ox, oy }) => return self.move_panel_to(self.mouse.0 - ox, self.mouse.1 - oy),
+            Some(Drag::PanelScroll { grab }) => return self.scroll_panel_to_mouse(self.mouse.1, grab),
             _ => {}
         }
         let g = self.geometry();
@@ -1385,7 +1502,7 @@ impl App {
                 let line = self.line_at_y(g, my);
                 self.select_lines(anchor_line, line);
             }
-            Some(Drag::Tab { .. }) | None => return,
+            Some(Drag::Tab { .. } | Drag::Panel { .. } | Drag::PanelScroll { .. }) | None => return,
         }
         self.refresh();
     }
@@ -1418,8 +1535,10 @@ impl App {
             let _ = ReleaseCapture();
             let _ = KillTimer(Some(self.hwnd), AUTOSCROLL_TIMER);
         }
-        if !matches!(drag, Drag::Tab { .. }) {
-            self.mouse_selection_done();
+        match drag {
+            Drag::Tab { .. } | Drag::PanelScroll { .. } => {}
+            Drag::Panel { .. } => self.save_panel_pos(),
+            _ => self.mouse_selection_done(),
         }
     }
 
@@ -1475,6 +1594,18 @@ impl App {
     }
 
     pub fn on_wheel(&mut self, delta: i32, horizontal: bool) {
+        // 詳細の編集中でも、パネルの外では本体をスクロールする
+        let (mx, my) = self.mouse;
+        let in_panel = self.detail_panel.is_some_and(|p| p.contains(mx, my));
+        if self.detail_edit.is_some() && !in_panel {
+            return self.with_main(|a| a.on_wheel(delta, horizontal));
+        }
+        // 表示中のパネルの上: パネルの内容をスクロールする (120 = 3 行)
+        if self.detail_edit.is_none() && in_panel && !horizontal {
+            self.panel_scroll -= delta as f32 / 40.0 * self.renderer.line_height;
+            self.invalidate();
+            return;
+        }
         let mods = input::current_modifiers();
         if mods.ctrl && !horizontal {
             let size = self.renderer.font_size + delta.signum() as f32;
@@ -1498,6 +1629,11 @@ impl App {
     }
 
     pub fn on_scroll(&mut self, vertical: bool, code: u16) {
+        // スクロールバーは常に本体
+        if self.detail_edit.is_some() {
+            self.with_main(|a| a.on_scroll(vertical, code));
+            return self.invalidate();
+        }
         const LINEUP: u16 = 0;
         const LINEDOWN: u16 = 1;
         const PAGEUP: u16 = 2;
@@ -1550,12 +1686,27 @@ impl App {
 
     /// WM_SETCURSOR: 編集領域では I ビーム。
     pub fn update_cursor(&self) {
-        let g = self.geometry();
+        let g = self.main_geometry();
         let (x, y) = self.mouse;
-        let id = if y < g.text_top || y >= g.text_bottom || x < g.gutter_w {
+        let panel = self.detail_panel;
+        let id = if self.panel_scrollbar.is_some_and(|sb| sb.hit(x, y)) {
             IDC_ARROW
-        } else if self.in_detail_panel(x, y)
-            || (input::current_modifiers().ctrl && self.drag.is_none() && self.url_at(&g, x, y).is_some())
+        } else if panel.is_some_and(|p| p.in_header(x, y)) {
+            IDC_SIZEALL
+        } else if panel.is_some_and(|p| p.contains(x, y)) {
+            if self.detail_edit.is_some() {
+                IDC_IBEAM
+            } else {
+                IDC_HAND
+            }
+        } else if self.badge_at(&g, x, y).is_some() {
+            IDC_HAND
+        } else if y < g.text_top || y >= g.text_bottom || x < g.gutter_w {
+            IDC_ARROW
+        } else if input::current_modifiers().ctrl
+            && self.drag.is_none()
+            && self.detail_edit.is_none()
+            && self.url_at(&g, x, y).is_some()
         {
             IDC_HAND
         } else {
@@ -1566,10 +1717,6 @@ impl App {
                 SetCursor(Some(c));
             }
         }
-    }
-
-    fn in_detail_panel(&self, x: f32, y: f32) -> bool {
-        self.detail_panel.is_some_and(|(l, t, r, b)| x >= l && x < r && y >= t && y < b)
     }
 
     /// マウスがウィンドウ上にあれば、現在のマウス位置でカーソルの形を更新する。

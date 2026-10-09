@@ -21,7 +21,7 @@ pub struct Document {
     pub preferred_col: Option<usize>,
     /// Vim のビジュアルモードの状態 (選択範囲は `vim` モジュールがこれから作る)。
     pub visual: Option<Visual>,
-    /// 行頭の詳細 (`*[…]`) を折りたたむか (.txt / .lvt で UI 層が有効にする)。
+    /// 装飾表示 (詳細 `*detail[…]` の折りたたみなど) を使うか (.txt / .lvt で UI 層が有効にする)。
     detail_view: bool,
     history: History,
     path: Option<PathBuf>,
@@ -161,7 +161,7 @@ impl Document {
         self.highlighter.highlight_line(text, state, out);
     }
 
-    // ---- 詳細 (`*[…]`) の折りたたみ ----
+    // ---- 詳細 (`*detail[…]`) の折りたたみ ----
 
     pub fn detail_view(&self) -> bool {
         self.detail_view
@@ -183,62 +183,87 @@ impl Document {
         }
     }
 
-    /// `pos` が詳細の内側なら、`forward` に応じて後ろ・前の端へ寄せる。
-    fn snap(&self, pos: usize, forward: bool) -> usize {
-        if !self.detail_view {
+    /// 行の詳細と行頭の位置。
+    fn token_of(&self, pos: usize) -> Option<(usize, Token)> {
+        let line = self.buffer.char_to_line(pos);
+        self.detail_at_line(line).map(|t| (self.buffer.line_to_char(line), t))
+    }
+
+    /// 詳細は本文では幅 0 (見えない) なので、キャレットは詳細の直前 (`start`) にだけ置く。
+    /// 詳細の内側や直後に来たら直前へ寄せる。ただし直前から前向きに 1 歩動いた場合は、
+    /// 見た目どおり次の文字を 1 つ越えた位置 (詳細の直後の文字の後ろ) へ進める。
+    fn snap(&self, pos: usize, from: Option<usize>) -> usize {
+        let Some((ls, t)) = self.token_of(pos) else { return pos };
+        let (ts, te) = (ls + t.start, ls + t.end);
+        if pos <= ts || pos > te {
             return pos;
         }
-        let line = self.buffer.char_to_line(pos);
-        let ls = self.buffer.line_to_char(line);
-        match self.detail_at_line(line) {
-            Some(t) if t.contains_inner(pos - ls) => ls + if forward { t.end } else { t.start },
-            _ => pos,
+        if from == Some(ts) && pos == ts + 1 && te < self.buffer.len_chars() {
+            te + 1
+        } else {
+            ts
         }
     }
 
-    /// 新しい選択の端が詳細の内側に入らないようにする。キャレットは移動の向きに、
-    /// 選択の起点は詳細全体を含む向きに寄せる。
+    /// 新しい選択の端が詳細の内側・直後に来ないようにする。
     fn snap_selection(&self, old: Selection, new: Selection) -> Selection {
         if !self.detail_view {
             return new;
         }
-        let head = self.snap(new.head, new.head > old.head);
-        let anchor = if new.anchor == new.head { head } else { self.snap(new.anchor, new.anchor > head) };
+        let head = self.snap(new.head, Some(old.head));
+        let anchor = if new.anchor == new.head { head } else { self.snap(new.anchor, None) };
         Selection::new(anchor, head)
     }
 
-    /// 詳細に一部だけかかる範囲を、詳細全体に広げる (詳細を壊さないように)。
-    /// 詳細の内容の中に収まる範囲 (置換など) と、詳細にかからない範囲はそのまま。
-    pub fn expand_range(&self, r: Range<usize>) -> Range<usize> {
-        if !self.detail_view {
+    /// 削除範囲を、見えない詳細に合わせて調整する。
+    /// - 詳細の内容の中に収まる範囲 (置換など) と、詳細にかからない範囲はそのまま。
+    /// - 詳細の直前から始まり詳細の中で終わる範囲 (Del や Vim の `x`) は、詳細の後ろの文字を消す。
+    /// - 詳細の手前から詳細の中・直後までの範囲は、詳細の手前までにする (詳細は残す)。
+    /// - 詳細の中から始まる範囲は、詳細の直後からにする。
+    /// - 詳細全体をまたいでその先まで消す範囲 (`dd`、複数行の選択など) は、詳細ごと消す。
+    pub fn adjust_range(&self, r: Range<usize>) -> Range<usize> {
+        if !self.detail_view || r.is_empty() {
             return r;
         }
-        let buf = &self.buffer;
-        let token_of = |p: usize| {
-            let line = buf.char_to_line(p);
-            let ls = buf.line_to_char(line);
-            detail::find_in_line(buf, line).map(|t| (ls, t))
-        };
+        let len = self.buffer.len_chars();
         let (mut s, mut e) = (r.start, r.end);
-        if let Some((ls, t)) = token_of(s) {
+        if let Some((ls, t)) = self.token_of(s) {
+            let (ts, te) = (ls + t.start, ls + t.end);
             let c = t.content();
             if ls + c.start <= s && e <= ls + c.end {
                 return r;
             }
-            if t.contains_inner(s - ls) {
-                if s == e {
-                    // 詳細の記号の間への挿入は、詳細の後ろへ
-                    return ls + t.end..ls + t.end;
-                }
-                s = ls + t.start;
+            if s == ts && e <= te {
+                let n = e - s;
+                return te..(te + n).min(len);
+            }
+            if ts < s && s < te {
+                s = te;
+            }
+            if s < ts && ts < e && e <= te {
+                e = ts;
             }
         }
-        if let Some((ls, t)) = token_of(e) {
-            if t.contains_inner(e - ls) {
-                e = ls + t.end;
+        if let Some((ls, t)) = self.token_of(e) {
+            let (ts, te) = (ls + t.start, ls + t.end);
+            if s < ts && ts < e && e <= te {
+                e = ts;
             }
         }
-        s..e
+        s..e.max(s)
+    }
+
+    /// 挿入位置を調整する。詳細の内側への挿入は詳細の後ろへ。行末にある詳細の直前に
+    /// 改行を挿入する場合 (行末で Enter) は、詳細を元の行に残すため詳細の後ろへ。
+    fn adjust_insert(&self, p: usize, text: &str) -> usize {
+        let Some((ls, t)) = self.token_of(p) else { return p };
+        let (ts, te) = (ls + t.start, ls + t.end);
+        let at_line_end = te == self.buffer.line_end(self.buffer.char_to_line(p));
+        if (ts < p && p < te) || (p == ts && at_line_end && text.contains('\n')) {
+            te
+        } else {
+            p
+        }
     }
 
     // ---- 変更系 ----
@@ -277,28 +302,40 @@ impl Document {
         if edits.is_empty() {
             return;
         }
-        // 詳細を壊す編集は詳細全体に広げ、キャレットは広げた範囲の先頭に置く
-        let mut expanded_at = None;
+        // 見えない詳細に合わせて編集範囲を調整し、キャレットは調整した編集の位置
+        // (挿入なら挿入した文字列の後ろ、削除なら先頭) に置く
+        // (編集前の位置, その後ろに足す文字数)
+        let mut adjusted_at: Option<(usize, usize)> = None;
         if self.detail_view {
             for e in &mut edits {
-                let r = self.expand_range(e.0.clone());
+                let r = if e.0.is_empty() {
+                    let p = self.adjust_insert(e.0.start, &e.1);
+                    p..p
+                } else {
+                    self.adjust_range(e.0.clone())
+                };
                 if r != e.0 {
-                    expanded_at = Some(expanded_at.map_or(r.start, |p: usize| p.min(r.start)));
+                    let caret = (r.start, if r.is_empty() { e.1.chars().count() } else { 0 });
+                    adjusted_at = Some(adjusted_at.map_or(caret, |p| p.min(caret)));
                     e.0 = r;
                 }
             }
-            if expanded_at.is_some() {
+            edits.retain(|e| !(e.0.is_empty() && e.1.is_empty()));
+            if edits.is_empty() {
+                return;
+            }
+            if adjusted_at.is_some() {
                 edits.sort_by_key(|e| e.0.start);
                 edits.dedup_by(|later, earlier| later.0.start < earlier.0.end);
             }
         }
-        let caret_after_expand = expanded_at.map(|p| {
+        let caret_after_expand = adjusted_at.map(|(p, extra)| {
             let delta: isize = edits
                 .iter()
                 .filter(|e| e.0.end <= p && e.0.start < p)
                 .map(|e| e.1.chars().count() as isize - e.0.len() as isize)
                 .sum();
-            (p as isize + delta) as usize
+            (p as isize + delta) as usize + extra
         });
         // 後ろから適用すれば前方の位置がずれない
         edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));

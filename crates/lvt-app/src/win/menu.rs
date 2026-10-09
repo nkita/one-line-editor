@@ -63,7 +63,7 @@ impl Menus {
         m.item(view, "Vim キーバインド(&V)", A::ToggleVim, mode)?;
         m.separator(view)?;
         m.item(view, "詳細を編集(&E)...", A::EditDetail, mode)?;
-        m.item(view, ".txt で詳細ビューを使う(&T)", A::ToggleTxtDetailView, mode)?;
+        m.item(view, ".txt で装飾表示を使う(&T)", A::ToggleTxtDetailView, mode)?;
 
         let enc = m.popup(m.bar, "文字コード(&C)")?;
         let reopen = m.popup(enc, "指定した文字コードで開き直す(&R)")?;

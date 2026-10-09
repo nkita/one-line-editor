@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
+    D2D1_ROUNDED_RECT,
     D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
 };
@@ -222,6 +223,44 @@ impl Renderer {
         let brush = unsafe { self.target.as_ref()?.CreateSolidColorBrush(&color, None).ok()? };
         self.brushes.insert(c.0, brush.clone());
         Some(brush)
+    }
+
+    /// 半透明のブラシ (`alpha` は 0.0〜1.0)。
+    fn brush_alpha(&mut self, c: Color, alpha: f32) -> Option<ID2D1SolidColorBrush> {
+        let a = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+        if a == 255 {
+            return self.brush(c);
+        }
+        // 不透明のブラシ (キー = 色) と区別するため、上位 8 ビットに alpha + 1 を入れる
+        let key = c.0 | ((a + 1) << 24);
+        if let Some(b) = self.brushes.get(&key) {
+            return Some(b.clone());
+        }
+        let (r, g, b) = c.rgb_f32();
+        let color = D2D1_COLOR_F { r, g, b, a: a as f32 / 255.0 };
+        let brush = unsafe { self.target.as_ref()?.CreateSolidColorBrush(&color, None).ok()? };
+        self.brushes.insert(key, brush.clone());
+        Some(brush)
+    }
+
+    /// 角丸の矩形を塗る。
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_round(&mut self, left: f32, top: f32, right: f32, bottom: f32, radius: f32, c: Color, alpha: f32) {
+        let Some(b) = self.brush_alpha(c, alpha) else { return };
+        let rr = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left, top, right, bottom }, radiusX: radius, radiusY: radius };
+        if let Some(t) = &self.target {
+            unsafe { t.FillRoundedRectangle(&rr, &b) };
+        }
+    }
+
+    /// 角丸の矩形の枠線を描く。
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_round(&mut self, left: f32, top: f32, right: f32, bottom: f32, radius: f32, c: Color, width: f32) {
+        let Some(b) = self.brush(c) else { return };
+        let rr = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left, top, right, bottom }, radiusX: radius, radiusY: radius };
+        if let Some(t) = &self.target {
+            unsafe { t.DrawRoundedRectangle(&rr, &b, width, None) };
+        }
     }
 
     pub fn clear(&mut self, c: Color) {

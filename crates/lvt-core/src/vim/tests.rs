@@ -229,16 +229,22 @@ fn standard_keys_in_normal_mode() {
 
 #[test]
 fn detail_tokens() {
-    let mut h = Harness::new("*[a\\nb] title\nnext", 0);
+    // 行末の詳細は見えないので、$ や行末は詳細の手前の文字
+    let mut h = Harness::new("ab *detail[a\\nb]\nnext", 0);
     h.doc.set_detail_view(true);
-    h.keys("l").check("*[a\\nb] title\nnext", 7);
-    h.keys("h").check("*[a\\nb] title\nnext", 0);
-    h.keys("x").check(" title\nnext", 0);
-    assert_eq!(h.clip.as_ref().unwrap().text, "*[a\\nb]"); // 詳細全体をヤンクする
-    h.keys("P").check("*[a\\nb] title\nnext", 0); // 貼り付け後のキャレットが詳細の内側なら先頭へ
-    h.keys("u").check(" title\nnext", 0);
-    let mut h = Harness::new("*[abc]", 6);
+    h.keys("$").check("ab *detail[a\\nb]\nnext", 2);
+    h.keys("lll").check("ab *detail[a\\nb]\nnext", 2);
+    h.keys("x").check("ab*detail[a\\nb]\nnext", 1);
+    h.keys("u").check("ab *detail[a\\nb]\nnext", 2);
+    h.keys("0D").check("*detail[a\\nb]\nnext", 0); // 見える文字だけ消え、詳細は残る
+    h.keys("u").keys("AZ<Esc>").check("ab Z*detail[a\\nb]\nnext", 3);
+    h.keys("onew<Esc>").check("ab Z*detail[a\\nb]\nnew\nnext", 20);
+    h.keys("kdd").check("new\nnext", 0); // 行ごと消すと詳細も消える
+    // 行の途中の詳細: x は詳細の後ろの文字を消す
+    let mut h = Harness::new("a *detail[q] b", 0);
     h.doc.set_detail_view(true);
-    h.keys("<Esc>").check("*[abc]", 0); // 行末の 1 つ手前は詳細の内側なので先頭へ
-    h.keys("jdd").check("", 0);
+    h.keys("ll").check("a *detail[q] b", 2);
+    h.keys("x").check("a *detail[q]b", 2);
+    assert_eq!(h.clip.as_ref().unwrap().text, " ");
+    h.keys("l").check("a *detail[q]b", 2); // 最後の見える文字 b (= 詳細の直前の位置)
 }

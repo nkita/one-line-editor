@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use crate::buffer::TextBuffer;
 use crate::command::{EditCommand, Motion};
-use crate::detail;
+use crate::lineview::LineView;
 use crate::document::Document;
 use crate::history::MergeKind;
 use crate::selection::Selection;
@@ -116,34 +116,24 @@ fn move_caret(doc: &mut Document, motion: Motion, extend: bool, cfg: &EditorConf
     doc.preferred_col = vertical.then_some(pref);
 }
 
-pub(crate) fn current_display_col(buf: &TextBuffer, pos: usize, tab: usize, detail_view: bool) -> usize {
+pub(crate) fn current_display_col(buf: &TextBuffer, pos: usize, tab: usize, decorated: bool) -> usize {
     let (line, col) = buf.line_col(pos);
-    match detail_token(buf, line, detail_view) {
-        Some(t) => {
-            let view = detail::view_text(&buf.line(line).to_string(), Some(t));
-            width::display_col(view.chars(), t.to_view(col, false), tab)
-        }
-        None => width::display_col(buf.line(line).chars(), col, tab),
-    }
-}
-
-/// 行の表示桁 `col` に最も近い文字位置。詳細を折りたたんでいる行では、折りたたんだ表示で数える。
-pub(crate) fn pos_at_display_col(buf: &TextBuffer, line: usize, col: usize, tab: usize, detail_view: bool) -> usize {
-    let start = buf.line_to_char(line);
-    match detail_token(buf, line, detail_view) {
-        Some(t) => {
-            let view = detail::view_text(&buf.line(line).to_string(), Some(t));
-            start + t.to_doc(width::char_col_at_display(view.chars(), col, tab))
-        }
-        None => start + width::char_col_at_display(buf.line(line).chars(), col, tab),
-    }
-}
-
-fn detail_token(buf: &TextBuffer, line: usize, detail_view: bool) -> Option<detail::Token> {
-    if detail_view {
-        detail::find_in_line(buf, line)
+    if decorated {
+        let v = LineView::build(&buf.line(line).to_string(), Some(col));
+        width::display_col(v.text.chars(), v.to_view(col, false), tab)
     } else {
-        None
+        width::display_col(buf.line(line).chars(), col, tab)
+    }
+}
+
+/// 行の表示桁 `col` に最も近い文字位置。装飾表示の行では、装飾後の表示 (キャレットがない状態) で数える。
+pub(crate) fn pos_at_display_col(buf: &TextBuffer, line: usize, col: usize, tab: usize, decorated: bool) -> usize {
+    let start = buf.line_to_char(line);
+    if decorated {
+        let v = LineView::build(&buf.line(line).to_string(), None);
+        start + v.to_doc(width::char_col_at_display(v.text.chars(), col, tab))
+    } else {
+        start + width::char_col_at_display(buf.line(line).chars(), col, tab)
     }
 }
 
@@ -440,52 +430,74 @@ mod detail_tests {
     }
 
     #[test]
-    fn caret_skips_detail() {
-        let mut d = doc("*[abc] x", 0);
-        run(&mut d, &[mv(Motion::Right)]);
-        assert_eq!(d.selection().head, 6);
-        run(&mut d, &[mv(Motion::Right), mv(Motion::Left), mv(Motion::Left)]);
-        assert_eq!(d.selection().head, 0);
-        d.set_selection(Selection::caret(3)); // 内側へは置けない (前向きの移動なので後ろの端へ)
-        assert_eq!(d.selection().head, 6);
-        d.set_selection(Selection::caret(0));
-        run(&mut d, &[EditCommand::Move { motion: Motion::Right, extend: true }]);
-        assert_eq!(d.selected_text(), "*[abc]");
+    fn caret_stays_before_hidden_detail() {
+        // 表示は "x  y" (詳細は幅 0)。詳細は 2..14
+        let mut d = doc("x *detail[abc] y", 0);
+        d.set_selection(Selection::caret(3)); // 内側には置けない → 直前へ
+        assert_eq!(d.selection().head, 2);
+        d.set_selection(Selection::caret(14)); // 直後も同じ位置に見えるので直前へ
+        assert_eq!(d.selection().head, 2);
+        run(&mut d, &[mv(Motion::Right)]); // 見た目どおり、次の空白を越える
+        assert_eq!(d.selection().head, 15);
+        run(&mut d, &[mv(Motion::Left)]);
+        assert_eq!(d.selection().head, 2);
+        run(&mut d, &[mv(Motion::Left)]);
+        assert_eq!(d.selection().head, 1);
     }
 
     #[test]
-    fn deleting_part_removes_whole_detail() {
-        let mut d = doc("  *[abc] x", 8);
-        run(&mut d, &[EditCommand::DeleteBackward]);
-        assert_eq!((d.buffer().to_string().as_str(), d.selection().head), ("   x", 2));
-        run(&mut d, &[EditCommand::Undo]);
-        assert_eq!(d.buffer().to_string(), "  *[abc] x");
-        d.set_selection(Selection::caret(2));
+    fn deleting_visible_chars_keeps_detail() {
+        let mut d = doc("x *detail[abc] y", 2);
+        run(&mut d, &[EditCommand::DeleteForward]); // 詳細の後ろの空白を消す
+        assert_eq!((d.buffer().to_string().as_str(), d.selection().head), ("x *detail[abc]y", 2));
+        run(&mut d, &[EditCommand::DeleteBackward]); // 詳細の前の空白を消す
+        assert_eq!((d.buffer().to_string().as_str(), d.selection().head), ("x*detail[abc]y", 1));
+        run(&mut d, &[EditCommand::Undo, EditCommand::Undo]);
+        assert_eq!(d.buffer().to_string(), "x *detail[abc] y");
+        // 詳細を含む範囲をまたいで消すと詳細ごと消える
+        d.set_selection(Selection::new(0, 16));
         run(&mut d, &[EditCommand::DeleteForward]);
-        assert_eq!(d.buffer().to_string(), "   x");
+        assert_eq!(d.buffer().to_string(), "");
+    }
+
+    #[test]
+    fn detail_at_line_end() {
+        let mut d = doc("abc *detail[x]\nnext", 0);
+        run(&mut d, &[mv(Motion::LineEnd)]);
+        assert_eq!(d.selection().head, 4); // 見た目の行末 = 詳細の直前
+        run(&mut d, &[EditCommand::InsertText("Z".into())]);
+        assert_eq!(d.buffer().to_string(), "abc Z*detail[x]\nnext");
+        run(&mut d, &[EditCommand::InsertNewline]); // 詳細は元の行に残る
+        assert_eq!((d.buffer().to_string().as_str(), d.selection().head), ("abc Z*detail[x]\n\nnext", 16));
+        d.set_selection(Selection::caret(5));
+        run(&mut d, &[EditCommand::DeleteForward]); // 行末で Del: 次の行と結合
+        assert_eq!(d.buffer().to_string(), "abc Z*detail[x]\nnext");
     }
 
     #[test]
     fn content_edits_and_insertions() {
-        let mut d = doc("*[abc] x", 0);
-        d.apply(vec![(2..5, "zz".into())], MergeKind::None, |_, _| Selection::caret(0));
-        assert_eq!(d.buffer().to_string(), "*[zz] x");
-        // 記号の間への挿入は詳細の後ろへ
-        d.apply(vec![(1..1, "Q".into())], MergeKind::None, |_, _| Selection::caret(0));
-        assert_eq!(d.buffer().to_string(), "*[zz]Q x");
-        // 折りたたみが無効なら通常の文字列
+        let mut d = doc("*detail[abc] x", 0);
+        d.apply(vec![(8..11, "zz".into())], MergeKind::None, |_, _| Selection::caret(0));
+        assert_eq!(d.buffer().to_string(), "*detail[zz] x");
+        // 記号の途中への挿入は詳細の後ろへ
+        d.apply(vec![(3..3, "Q".into())], MergeKind::None, |_, _| Selection::caret(0));
+        assert_eq!(d.buffer().to_string(), "*detail[zz]Q x");
+        // 装飾表示が無効なら通常の文字列
         d.set_detail_view(false);
         d.set_selection(Selection::caret(3));
         assert_eq!(d.selection().head, 3);
     }
 
     #[test]
-    fn vertical_move_uses_folded_columns() {
-        // 表示は "📝xy" (アイコンは 2 桁)
-        let mut d = doc("*[abc]xy\nabcdef", 7);
+    fn vertical_move_uses_decorated_columns() {
+        // 表示は "xyz" と "**b**cd" → "bcd"
+        let mut d = doc("x*detail[abc]yz\nabcdef", 14);
         run(&mut d, &[mv(Motion::Down)]);
-        assert_eq!(d.selection().head, 12);
+        assert_eq!(d.selection().head, 16 + 2);
         run(&mut d, &[mv(Motion::Up)]);
-        assert_eq!(d.selection().head, 7);
+        assert_eq!(d.selection().head, 14);
+        let mut d = doc("**b**cd\nabcdef", 9);
+        run(&mut d, &[mv(Motion::Up)]); // 表示 "bcd" の 1 桁目 = b の後ろ (閉じ記号の外)
+        assert_eq!(d.selection().head, 5);
     }
 }

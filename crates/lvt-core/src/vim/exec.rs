@@ -8,7 +8,7 @@ use crate::editor::{indent_unit, outdent_len, EditorConfig, ViewInfo};
 use crate::history::MergeKind;
 use crate::selection::Selection;
 
-use super::motion::{self, first_nonblank, last_char, Ctx, MotionKind};
+use super::motion::{self, first_nonblank, Ctx, MotionKind};
 use super::{InsertAt, OpTarget, Operator, Register, Visual, VimEdit, VimMotion};
 
 /// 演算子を適用する範囲。
@@ -136,7 +136,7 @@ pub fn normalize_caret(doc: &mut Document) {
     let sel = doc.selection();
     let p = if sel.is_empty() { sel.head } else { sel.start() };
     let line = doc.buffer().char_to_line(p);
-    let p = p.min(last_char(doc.buffer(), line));
+    let p = p.min(motion::last_visible_char(doc.buffer(), line, doc.detail_view()));
     doc.set_selection(Selection::caret(p));
 }
 
@@ -189,9 +189,9 @@ fn operate(
         OpTarget::Object { obj, inner } => Span::Chars(motion::object_range(buf, pos, obj, inner, n)?),
         OpTarget::Motion(m) => motion_span(doc, op, m, count, cfg, view)?,
     };
-    // 詳細に一部だけかかる場合は詳細全体を対象にする (ヤンクする文字列も合わせる)
+    // 見えない詳細に合わせて範囲を調整する (ヤンクする文字列も実際に消す範囲に合わせる)
     let span = match span {
-        Span::Chars(r) => Span::Chars(doc.expand_range(r)),
+        Span::Chars(r) => Span::Chars(doc.adjust_range(r)),
         lines => lines,
     };
     doc.visual = None;

@@ -29,7 +29,7 @@ lvt は、EmEditor のように **高速・省メモリ・シンプル** なこ�
 | タブ | 新規・切り替え・閉じる、未保存マーク、同じファイルは同じタブへ、ドラッグ (と Ctrl+Shift+PgUp/PgDn) での並べ替え |
 | 検索 | インクリメンタル検索、次/前 (折り返しあり)、大文字小文字の区別、正規表現、全置換 (`$1` 参照)、行番号へ移動 |
 | 表示 | 行番号、現在行の強調、検索一致の強調、Markdown のハイライト、URL の自動リンク (Ctrl+クリックでブラウザを開く)、ライト/ダークテーマ、文字サイズ変更、高 DPI 対応 |
-| 詳細 (1 行 TODO) | .txt / .lvt で、行頭の `*[内容]` (改行は `\n`) を 📝 1 文字に折りたたむ。キャレットは中に入らず、かかる削除は全体を消す。キャレット行の内容を本文の右上の詳細パネルに改行込みで表示し、F2 / ダブルクリック / パネルのクリックで編集ウィンドウを開く。.txt では表示メニューで無効にできる |
+| 装飾表示 (.txt / .lvt) | **詳細 (1 行 TODO)**: 行内の `*detail[内容]` (改行は `\n`) は本文では隠し、行番号の右隣のバッジで示す。キャレットは詳細の手前にだけ置き、見える文字の移動・削除は詳細を飛び越える (詳細を含む範囲をまたいだ削除だけ詳細ごと消える)。キャレット行の内容を詳細パネル (角丸。見出しのドラッグで移動して位置を記憶、スクロールバー付き、装飾表示) に表示し、F2 / バッジのクリック / パネルのクリックでパネル内で編集する (本体と同じ編集機能・Vim)。**記法**: `[label](url)` は label のリンク (Ctrl+クリックで url を開く)、`` `code` `` と `**強調**` は記号を隠す。キャレットが乗った要素だけ記法のまま表示する。.txt では表示メニューで無効にできる |
 | Vim | Normal / Insert / Visual / Visual Line、モーション・演算子・テキストオブジェクト・回数、`.`、`:` コマンド (`:w` `:q` `:s` など)、`/` `?` `n` `N` `*` `#`。**既定でオン**。ヤンクは OS のクリップボードと共有。`:` `/` `?` はステータスバーの行・桁の位置で入力する。オン/オフは次回起動時も保持 (`%APPDATA%\lvt\settings.toml`) |
 
 ### 1.2 非機能要件
@@ -66,7 +66,7 @@ lvt-editor-c/
 │  ├─ lvt-core/            ★ OS 非依存の中核 (Linux 上で cargo test できる)
 │  │  ├─ src/              buffer / selection / history / document / editor / command /
 │  │  │                    keymap / search / encoding / syntax / theme / width /
-│  │  │                    link / settings / detail / vim/ (mod, parse, exec, motion, ex)
+│  │  │                    link / settings / detail / lineview / vim/ (mod, parse, exec, motion, ex)
 │  │  └─ examples/load_bench.rs   読み込み・検索の速度計測
 │  └─ lvt-app/             ★ Windows フロントエンド (bin: lvt.exe)
 │     └─ src/win/          mod / app / paint / render / menu / prompt / dialogs / input / util
