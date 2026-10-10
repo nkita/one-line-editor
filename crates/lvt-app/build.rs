@@ -1,4 +1,5 @@
-//! Windows 向けビルドで、アプリケーション マニフェスト (res/lvt.manifest) を exe に埋め込む。
+//! Windows 向けビルドで、アプリケーション マニフェスト (res/lvt.manifest) とアイコン (res/*.ico) を exe に埋め込む。
+//! MSVC ではマニフェストだけを埋め込む (アイコンは GNU ターゲットのみ)。
 
 use std::env;
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=res/lvt.manifest");
     println!("cargo:rerun-if-changed=res/lvt.rc");
+    println!("cargo:rerun-if-changed=res/lvt.ico");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

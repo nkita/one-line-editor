@@ -16,8 +16,10 @@ Win32 API と Direct2D/DirectWrite で書かれた UI 層です。`windows` crat
 | `win/dialogs.rs` | ファイルを開く/保存ダイアログ、メッセージボックス、クリップボード (CRLF ⇔ LF の変換) |
 | `win/input.rs` | 仮想キーコード → `Key`、修飾キーの状態 |
 | `win/panel.rs` | 詳細パネル: 位置の計算・ドラッグ・パネル内での編集の開始と終了 (`DetailEdit`) |
+| `win/scrollbar.rs` | 本文のスクロールバー (自前で描画・操作) |
+| `win/jumplist.rs` | タスクバーのジャンプリスト (最近使ったファイル)、AppUserModelID |
 | `win/util.rs` | UTF-16 変換 (文字・バイト ⇔ UTF-16 位置)、lParam/wParam の分解 |
-| `build.rs` + `res/` | アプリケーション マニフェスト (`res/lvt.manifest`) を exe に埋め込む。コモンコントロール v6 を指定し、ダイアログ・メッセージボックスを現行の Windows の見た目にする。GNU では `x86_64-w64-mingw32-windres` でリソースを作ってリンクし、MSVC ではリンカーの `/MANIFESTINPUT` を使う |
+| `build.rs` + `res/` | アプリケーション マニフェスト (`res/lvt.manifest`) とアイコン (`res/lvt.ico`、`lvt.rc` の ID 1。ウィンドウクラスの `hIcon` / `hIconSm` も `app_icon` でこれを読む) を exe に埋め込む (アイコンは GNU ターゲットのみ)。コモンコントロール v6 を指定し、ダイアログ・メッセージボックスを現行の Windows の見た目にする。GNU では `x86_64-w64-mingw32-windres` でリソースを作ってリンクし、MSVC ではリンカーの `/MANIFESTINPUT` を使う |
 
 ## 2. 状態の所有と再入対策 (重要)
 
@@ -59,7 +61,9 @@ enum Deferred { Open, OpenPaths(Vec<PathBuf>), Save(usize), SaveAs(usize), Close
 | `WM_DROPFILES` | ドロップされたファイルを開く (`Deferred::OpenPaths`) |
 | `WM_DPICHANGED` | `Renderer::set_dpi` のあと、推奨された矩形にウィンドウを移す |
 | `WM_CLOSE` | `Deferred::Exit` (未保存のタブを順に確認し、すべて了承されれば `DestroyWindow`) |
-| `WM_DESTROY` | `App` を破棄して `PostQuitMessage` |
+| `WM_DESTROY` | セッションを保存 (`App::save_session`) してから `App` を破棄して `PostQuitMessage` |
+| `WM_COPYDATA` | 別に起動した lvt から渡されたパス (`COPYDATA_OPEN`、UTF-16 を `\n` 区切り) を `PENDING_OPEN` に積み、`WM_APP_OPEN` を投函する (送り手を待たせない) |
+| `WM_APP_OPEN` (`WM_APP + 1`) | `PENDING_OPEN` のファイルを開く (`Deferred::OpenPaths`) |
 
 ## 4. キー入力の振り分け (`App::on_key_down`)
 
@@ -147,6 +151,10 @@ IMM32 を使います。
 - **保存** (`save`): パスがない、または「名前を付けて保存」ならダイアログを出す → `App::save_tab` → `Unmappable` なら「UTF-8 で保存するか」を確認して再試行する。
 - **閉じる** (`confirm_discard`): 変更があれば、そのタブを表示してから「はい / いいえ / キャンセル」で確認する。
 - **終了** (`confirm_close_all`): すべてのタブで `confirm_discard` を行い、1 つでもキャンセルされれば中止する。
+- **ウィンドウは 1 つ** (`forward_to_running`): 起動時にクラス `lvt.main` のウィンドウがあれば、引数のパスを絶対パスにして `WM_COPYDATA` で渡し、そのウィンドウを前面に出して終了する。ジャンプリストや関連付けから開いてもタブが増えるだけになる。
+- **セッション** (`lvt_core::session::Session`、`%APPDATA%\lvt\session.txt`): 終了時 (`WM_DESTROY`) にファイルのあるタブのパス・キャレット・先頭の行とアクティブなタブを保存し、起動時に `App::restore_session` で開き直す (コマンドライン引数のファイルはその後に開く)。無題のタブは保存しない (終了時の未保存の確認は従来どおり)。開けないファイルは飛ばして件数をステータスバーに出す。
+- **最近使ったファイル** (`lvt_core::session::RecentFiles`、`%APPDATA%\lvt\recent.txt`、10 件): 開いたとき・保存したときに `App::note_recent` で先頭に入れ、ファイルとジャンプリストを更新する。ファイルメニューの「最近使ったファイル」は `WM_INITMENUPOPUP` で作り直す (`Menus::update_recent`。ID は `RECENT_ID` + 番号、クリアは `RECENT_CLEAR_ID`)。開けなかった項目は一覧から外す。
+- **ジャンプリスト** (`jumplist.rs`): 起動時に AppUserModelID (`lvt.editor`) を設定し、`ICustomDestinationList` の独自の分類「最近使ったファイル」に `lvt.exe "パス"` のショートカット (`IShellLinkW`、表示名は `PKEY_Title`) を並べる。拡張子の関連付けは不要。ユーザーがジャンプリストから削除した項目は除く (追加すると失敗するため)。
 
 ## 11. Windows API を使うときの注意
 

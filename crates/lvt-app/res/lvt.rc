@@ -1,2 +1,5 @@
 // 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
 1 24 "lvt.manifest"
+// アプリのアイコン (ID 1)。Explorer・タスクバー・ジャンプリストは exe の最初のアイコンを使う。
+// lvt.ico は lvt-icon.png (元画像) から作った 16〜256px の 9 サイズ入り
+1 ICON "lvt.ico"

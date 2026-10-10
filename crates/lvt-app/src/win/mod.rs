@@ -3,6 +3,7 @@
 mod app;
 mod dialogs;
 mod input;
+mod jumplist;
 mod menu;
 mod paint;
 mod panel;
@@ -18,6 +19,7 @@ use lvt_core::encoding::{SaveError, TextEncoding};
 use lvt_core::settings::Settings;
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -28,12 +30,19 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDR
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use app::{App, Deferred, KeyOutcome};
-use menu::Menus;
+use menu::{Menus, RecentAction};
 use util::{hiword, loword, point_from_lparam, wheel_delta, wide};
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// 別に起動した lvt から渡された、開くファイル (WM_COPYDATA で受け取り、WM_APP_OPEN で開く)。
+    static PENDING_OPEN: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
+
+/// WM_COPYDATA の種類 (lvt のファイルを開く要求)。
+const COPYDATA_OPEN: usize = 0x6C76_7401;
+/// 受け取ったファイルを開く (WM_COPYDATA の送り手を待たせないよう、投函して後で処理する)。
+const WM_APP_OPEN: u32 = WM_APP + 1;
 
 /// `App` を借用して処理する。再入 (モーダルダイアログ中のメッセージ等) で
 /// 借用できない場合は何もしない。
@@ -55,17 +64,60 @@ pub fn run() {
     }
 }
 
+/// 既に lvt のウィンドウがあれば、引数のファイルをそのウィンドウで開かせて前面に出す (true を返す)。
+/// ウィンドウを 1 つにするため (ジャンプリスト・関連付けから開いたときもタブが増えるだけにする)。
+fn forward_to_running(class: PCWSTR) -> bool {
+    unsafe {
+        let Ok(hwnd) = FindWindowW(class, PCWSTR::null()) else { return false };
+        // 相対パスはこのプロセスのカレントディレクトリで解決してから渡す
+        let paths: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|a| std::path::absolute(&a).unwrap_or_else(|_| PathBuf::from(a)).display().to_string())
+            .collect();
+        if !paths.is_empty() {
+            let data: Vec<u16> = paths.join("\n").encode_utf16().collect();
+            let cds = COPYDATASTRUCT {
+                dwData: COPYDATA_OPEN,
+                cbData: (data.len() * 2) as u32,
+                lpData: data.as_ptr() as *mut _,
+            };
+            SendMessageW(hwnd, WM_COPYDATA, None, Some(LPARAM(&cds as *const _ as isize)));
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        true
+    }
+}
+
+/// exe に埋め込んだアイコン (res/lvt.rc の ID 1) を指定の大きさで読む。なければ標準のアイコン。
+fn app_icon(hinst: HINSTANCE, cx: SYSTEM_METRICS_INDEX, cy: SYSTEM_METRICS_INDEX) -> HICON {
+    unsafe {
+        let (w, h) = (GetSystemMetrics(cx), GetSystemMetrics(cy));
+        match LoadImageW(Some(hinst), PCWSTR(1 as _), IMAGE_ICON, w, h, LR_DEFAULTCOLOR) {
+            Ok(h) => HICON(h.0),
+            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        }
+    }
+}
+
 fn start() -> Result<()> {
     unsafe {
         let hinst = HINSTANCE(GetModuleHandleW(None)?.0);
         let class = w!("lvt.main");
+        if forward_to_running(class) {
+            return Ok(());
+        }
+        jumplist::set_app_id();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            hIcon: app_icon(hinst, SM_CXICON, SM_CYICON),
+            hIconSm: app_icon(hinst, SM_CXSMICON, SM_CYSMICON),
             lpszClassName: class,
             ..Default::default()
         };
@@ -96,6 +148,12 @@ fn start() -> Result<()> {
         APP.with(|c| *c.borrow_mut() = Some(app));
         DragAcceptFiles(hwnd, true);
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+
+        // 前回開いていたタブを復元し、ジャンプリストを最近使ったファイルで作り直す
+        with_app(|a| {
+            a.restore_session();
+            jumplist::update(a.recent.paths());
+        });
 
         let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
         if !files.is_empty() {
@@ -204,6 +262,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         WM_SETCURSOR if loword(lp.0 as usize) as u32 == HTCLIENT => {
             with_app(|a| a.update_cursor()).is_some()
         }
+        WM_COMMAND if Menus::recent_action(loword(wp.0)).is_some() => {
+            match Menus::recent_action(loword(wp.0)) {
+                Some(RecentAction::Open(i)) => open_recent(hwnd, i),
+                Some(RecentAction::Clear) => {
+                    with_app(|a| a.clear_recent());
+                }
+                None => {}
+            }
+            true
+        }
+        WM_COPYDATA => {
+            let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
+            if cds.dwData == COPYDATA_OPEN && !cds.lpData.is_null() {
+                let data = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
+                let paths = String::from_utf16_lossy(data).split('\n').filter(|p| !p.is_empty()).map(PathBuf::from).collect::<Vec<_>>();
+                PENDING_OPEN.with(|p| p.borrow_mut().extend(paths));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_APP_OPEN, WPARAM(0), LPARAM(0));
+                }
+            }
+            return LRESULT(1);
+        }
+        WM_APP_OPEN => {
+            let paths = PENDING_OPEN.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            if !paths.is_empty() {
+                run_deferred(hwnd, Deferred::OpenPaths(paths));
+            }
+            true
+        }
         WM_COMMAND => {
             if let Some(cmd) = with_app(|a| a.menus.command(loword(wp.0))).flatten() {
                 if let Some(d) = with_app(|a| a.execute_commands(vec![cmd])).flatten() {
@@ -262,6 +349,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             true
         }
         WM_DESTROY => {
+            with_app(|a| a.save_session());
             APP.with(|c| c.try_borrow_mut().map(|mut a| a.take()).ok());
             unsafe { PostQuitMessage(0) };
             true
@@ -353,6 +441,18 @@ fn run_deferred(hwnd: HWND, d: Deferred) {
                 close_tab(hwnd, idx);
             }
         }
+    }
+    with_app(|a| a.refresh());
+}
+
+/// 最近使ったファイルの `i` 番目を開く。開けなければ一覧から外す。
+fn open_recent(hwnd: HWND, i: usize) {
+    let Some(path) = with_app(|a| a.recent.paths().get(i).cloned()).flatten() else { return };
+    with_app(|a| a.finish_detail_edit(true));
+    let errors = with_app(|a| a.open_paths(vec![path.clone()])).unwrap_or_default();
+    if !errors.is_empty() {
+        with_app(|a| a.remove_recent(&path));
+        dialogs::error(hwnd, &format!("ファイルを開けませんでした (一覧から外しました)。\n\n{}", errors.join("\n\n")));
     }
     with_app(|a| a.refresh());
 }

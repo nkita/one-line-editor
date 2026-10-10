@@ -14,6 +14,7 @@ use lvt_core::keymap::{InputMode, Key, KeyChord, Keymap, ModeResponse, StandardM
 use lvt_core::detail;
 use lvt_core::lineview::{self, LineView};
 use lvt_core::link;
+use lvt_core::session::{RecentFiles, Session, SessionTab};
 use lvt_core::settings::Settings;
 use lvt_core::vim::{self, ex, Register, VimEdit, VimMode};
 use lvt_core::search::{self, SearchQuery};
@@ -181,6 +182,8 @@ pub struct App {
     was_normal: bool,
     pub(super) settings: Settings,
     settings_path: Option<PathBuf>,
+    /// 最近使ったファイル (`%APPDATA%\lvt\recent.txt`)。
+    pub recent: RecentFiles,
     /// 入力欄の処理 (`:w` など) から返す `Deferred`。
     pending_deferred: Option<Deferred>,
     /// .txt で詳細の折りたたみ表示を使うか (.lvt は常に使う)。
@@ -216,7 +219,12 @@ pub fn make_mode(vim: bool) -> Box<dyn InputMode> {
 
 /// 設定ファイルの場所 (`%APPDATA%\lvt\settings.toml`)。
 pub fn settings_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("lvt").join("settings.toml"))
+    data_file("settings.toml")
+}
+
+/// lvt が記憶するファイルの場所 (`%APPDATA%\lvt\<name>`)。
+pub fn data_file(name: &str) -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("lvt").join(name))
 }
 
 impl App {
@@ -265,6 +273,7 @@ impl App {
             was_normal: false,
             settings,
             settings_path,
+            recent: data_file("recent.txt").map(|p| RecentFiles::load(&p)).unwrap_or_default(),
             pending_deferred: None,
             txt_detail_view,
             detail_panel: None,
@@ -907,6 +916,7 @@ impl App {
             let path = std::path::absolute(&path).unwrap_or(path);
             if let Some(i) = self.tabs.iter().position(|t| t.doc.path() == Some(path.as_path())) {
                 self.activate(i);
+                self.note_recent(&path);
                 continue;
             }
             set_wait_cursor();
@@ -925,6 +935,7 @@ impl App {
                         msg.push_str(" ※不正なバイト列を U+FFFD に置き換えました");
                     }
                     self.status = Some(msg);
+                    self.note_recent(&path);
                 }
                 Err(e) => errors.push(format!("{}\n{}", path.display(), e)),
             }
@@ -940,8 +951,84 @@ impl App {
         tab.doc.save_as(path)?;
         self.update_detail_views(); // 拡張子が変わった場合
         self.status = Some(format!("保存しました: {}", path.display()));
+        self.note_recent(path);
         self.refresh();
         Ok(())
+    }
+
+    // ---- 最近使ったファイル・セッション ----
+
+    /// 最近使ったファイルの先頭に追加し、ファイルとジャンプリストを更新する。
+    pub fn note_recent(&mut self, path: &Path) {
+        self.recent.push(path);
+        self.recent_changed();
+    }
+
+    pub fn remove_recent(&mut self, path: &Path) {
+        self.recent.remove(path);
+        self.recent_changed();
+    }
+
+    pub fn clear_recent(&mut self) {
+        self.recent.clear();
+        self.recent_changed();
+    }
+
+    fn recent_changed(&mut self) {
+        if let Some(p) = data_file("recent.txt") {
+            let _ = self.recent.save(&p);
+        }
+        super::jumplist::update(self.recent.paths());
+    }
+
+    /// 終了時: ファイルのあるタブ (無題のタブは除く) と、キャレット・スクロールの位置を保存する。
+    pub fn save_session(&mut self) {
+        self.finish_detail_edit(true);
+        let mut session = Session::default();
+        for (i, t) in self.tabs.iter().enumerate() {
+            let Some(path) = t.doc.path() else { continue };
+            if i <= self.active {
+                session.active = session.tabs.len();
+            }
+            session.tabs.push(SessionTab { path: path.to_path_buf(), caret: t.doc.caret_pos(), scroll_line: t.scroll_line });
+        }
+        if let Some(p) = data_file("session.txt") {
+            let _ = session.save(&p);
+        }
+    }
+
+    /// 起動時: 前回のタブを開き直す。見つからない・開けないファイルは飛ばしてステータスバーに件数を出す。
+    pub fn restore_session(&mut self) {
+        let Some(session) = data_file("session.txt").map(|p| Session::load(&p)) else { return };
+        let mut missing = 0;
+        let mut active = None;
+        for (i, st) in session.tabs.iter().enumerate() {
+            if self.tabs.iter().any(|t| t.doc.path() == Some(st.path.as_path())) {
+                continue;
+            }
+            let Ok((doc, _)) = Document::open(&st.path, None) else {
+                missing += 1;
+                continue;
+            };
+            let mut tab = Tab::new(doc);
+            let caret = st.caret.min(tab.doc.buffer().len_chars());
+            tab.doc.set_selection(Selection::caret(caret));
+            tab.scroll_line = st.scroll_line;
+            if self.tabs.len() == 1 && self.tabs[0].doc.is_pristine() {
+                self.tabs[0] = tab;
+            } else {
+                self.tabs.push(tab);
+            }
+            if i == session.active {
+                active = Some(self.tabs.len() - 1);
+            }
+        }
+        self.active = active.unwrap_or(self.tabs.len() - 1);
+        self.update_detail_views();
+        if missing > 0 {
+            self.status = Some(format!("前回のタブのうち {missing} 件のファイルが見つかりませんでした"));
+        }
+        self.refresh();
     }
 
     pub fn remove_tab(&mut self, idx: usize) {
@@ -1829,6 +1916,7 @@ impl App {
 
     pub fn update_menu(&self) {
         self.menus.update(self.doc(), self.theme.name == "dark", self.vim_enabled, self.txt_detail_view);
+        self.menus.update_recent(self.recent.paths());
     }
 
     // ---- IME ----

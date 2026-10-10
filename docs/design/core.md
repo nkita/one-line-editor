@@ -271,6 +271,11 @@ VimMode { state: Normal | Insert | Visual{linewise}, pending: Vec<Tok>, fallback
 | `txt_detail_view` | `true` (既定) / `false`。.txt で装飾表示を使うか |
 | `detail_panel_pos` | `"0.9500,0.0000"` のような、詳細パネルの位置 (本文の領域に対する割合)。ドラッグで動かすと保存する |
 
+### session.rs — セッションと最近使ったファイル
+
+- `RecentFiles`: 新しい順のパスの一覧 (最大 `RECENT_MAX` = 10)。`push` は同じパス (大文字・小文字を区別しない `same_path`) を先頭へ移す。1 行 1 パスで保存する。
+- `Session`: 終了時に開いていたタブ (`SessionTab { path, caret, scroll_line }`) とアクティブなタブ。1 行目が `active<TAB>番号`、続く各行が `パス<TAB>キャレット<TAB>先頭の行`。読めない数値は 0、範囲外の `active` は丸める。
+
 ## 17. detail.rs — 詳細 (`*detail[…]`)
 
 - **記法**: 行内の `*detail[` から、エスケープされていない最初の `]` まで (1 行で最初の 1 つ)。内容の中では `\n` が改行、`\]` が `]`、`\\` が `\` (`escape` / `unescape`)。閉じがなければ詳細ではない。新しく作るときは行末に置く (ファイルをそのまま読むと「本文 → 詳細」の順になる)。

@@ -1,33 +1,47 @@
 //! メニューバー。各項目は `Command` に対応付けられ、ショートカット表示は
 //! 現在の入力モードのキー割り当てから生成する。
 
+use std::path::PathBuf;
+
 use lvt_core::encoding::{LineEnding, TextEncoding};
 use lvt_core::keymap::InputMode;
 use lvt_core::{AppCommand, Command, Document, EditCommand};
 use windows::core::{Result, PCWSTR};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, EnableMenuItem, HMENU, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, DeleteMenu, EnableMenuItem, GetMenuItemCount, HMENU,
+    MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
 };
 
 use super::util::wide;
 
 const FIRST_ID: usize = 1000;
+/// 「最近使ったファイル」の項目の ID (`RECENT_ID + 番号`) と、一覧のクリア。
+const RECENT_ID: usize = 9000;
+const RECENT_CLEAR_ID: usize = 8999;
+
+/// 「最近使ったファイル」のサブメニューの操作。
+pub enum RecentAction {
+    Open(usize),
+    Clear,
+}
 
 pub struct Menus {
     pub bar: HMENU,
     items: Vec<Command>,
+    /// 「最近使ったファイル」のサブメニュー (開く直前に作り直す)。
+    recent: HMENU,
 }
 
 impl Menus {
     pub fn build(mode: &dyn InputMode) -> Result<Self> {
         use AppCommand as A;
         use EditCommand as E;
-        let mut m = Menus { bar: unsafe { CreateMenu()? }, items: Vec::new() };
+        let mut m = Menus { bar: unsafe { CreateMenu()? }, items: Vec::new(), recent: HMENU::default() };
 
         let file = m.popup(m.bar, "ファイル(&F)")?;
         m.item(file, "新規(&N)", A::NewTab, mode)?;
         m.item(file, "開く(&O)...", A::Open, mode)?;
+        m.recent = m.popup(file, "最近使ったファイル(&R)")?;
         m.item(file, "上書き保存(&S)", A::Save, mode)?;
         m.item(file, "名前を付けて保存(&A)...", A::SaveAs, mode)?;
         m.separator(file)?;
@@ -102,6 +116,39 @@ impl Menus {
         self.items.push(cmd);
         let w = wide(&text);
         unsafe { AppendMenuW(menu, MF_STRING, id, PCWSTR(w.as_ptr())) }
+    }
+
+    /// 「最近使ったファイル」のサブメニューを作り直す (番号 1〜9, 0 をアクセスキーにする)。
+    pub fn update_recent(&self, paths: &[PathBuf]) {
+        unsafe {
+            while GetMenuItemCount(Some(self.recent)) > 0 {
+                if DeleteMenu(self.recent, 0, MF_BYPOSITION).is_err() {
+                    break;
+                }
+            }
+            if paths.is_empty() {
+                let w = wide("(なし)");
+                let _ = AppendMenuW(self.recent, MF_STRING | MF_GRAYED, RECENT_ID, PCWSTR(w.as_ptr()));
+                return;
+            }
+            for (i, p) in paths.iter().enumerate() {
+                let key = if i < 9 { format!("&{}", i + 1) } else { "1&0".to_string() };
+                // `&` はアクセスキーの記号なので、パスの中の `&` は `&&` にする
+                let w = wide(&format!("{key}  {}", p.display().to_string().replace('&', "&&")));
+                let _ = AppendMenuW(self.recent, MF_STRING, RECENT_ID + i, PCWSTR(w.as_ptr()));
+            }
+            let _ = AppendMenuW(self.recent, MF_SEPARATOR, 0, PCWSTR::null());
+            let w = wide("一覧をクリア(&C)");
+            let _ = AppendMenuW(self.recent, MF_STRING, RECENT_CLEAR_ID, PCWSTR(w.as_ptr()));
+        }
+    }
+
+    pub fn recent_action(id: u16) -> Option<RecentAction> {
+        match id as usize {
+            RECENT_CLEAR_ID => Some(RecentAction::Clear),
+            i if (RECENT_ID..RECENT_ID + lvt_core::session::RECENT_MAX).contains(&i) => Some(RecentAction::Open(i - RECENT_ID)),
+            _ => None,
+        }
     }
 
     pub fn command(&self, id: u16) -> Option<Command> {

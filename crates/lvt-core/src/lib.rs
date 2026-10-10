@@ -21,6 +21,7 @@ pub mod lineview;
 pub mod link;
 pub mod search;
 pub mod selection;
+pub mod session;
 pub mod settings;
 pub mod syntax;
 pub mod theme;
