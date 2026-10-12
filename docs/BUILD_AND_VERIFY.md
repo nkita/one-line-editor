@@ -229,3 +229,12 @@ python3 scripts/gen_testdata.py /mnt/c/Users/<名前>/lvt/testdata 300   # 300MB
 - Windows のバージョン、ディスプレイの拡大率、IME の種類 (Microsoft IME / Google 日本語入力 など)
 - 再現手順と、可能であれば対象ファイル
 - デバッグ版 (`cargo build-win`) で再現した場合は、コンソールに出たメッセージ
+
+## 7. リリース (GitHub Releases)
+
+1. `Cargo.toml` の `[workspace.package] version` を上げてコミットする (exe のプロパティのバージョンにも入る。build.rs が version.rc を生成する)
+2. §5 のチェックリストで動作を確認する
+3. `scripts/package.sh` で `dist/lvt-v<version>-windows-x64.zip` (lvt.exe・LICENSE・README.md) と SHA256 を作る (`dist/` は git に入れない)
+4. タグを付けて push する: `git tag -a v<version> -m "lvt v<version>"` → `git push origin v<version>`
+5. GitHub のリポジトリ → Releases → Draft a new release → タグを選び、タイトル (`lvt v<version>`)・説明 (変更点、インストール方法、SHA256) を書いて zip を添付し、Publish release
+

@@ -15,6 +15,15 @@
 - [開発ガイド](docs/DEVELOPMENT.md): 規約・テスト・完了の定義
 - [ビルドと動作検証の手順](docs/BUILD_AND_VERIFY.md)
 
+## インストール
+
+1. [Releases](https://github.com/nkita/one-line-editor/releases) から `lvt-v<バージョン>-windows-x64.zip` をダウンロードして展開する
+2. `lvt.exe` を任意の場所に置いて起動する (例: `%LOCALAPPDATA%\Programs\lvt\`)。インストーラーやランタイムは不要
+   - 署名していないため、初回は「Windows によって PC が保護されました」と出ることがあります。「詳細情報」→「実行」で起動できます
+3. 必要ならタスクバーにピン留めする (ジャンプリストに最近使ったファイルが出る)。.txt / .lvt は「プログラムから開く」で lvt.exe を選ぶ
+
+設定・最近使ったファイル・前回のタブは `%APPDATA%\lvt\` に保存されます (exe の場所によらない)。アンインストールは exe と このフォルダを削除するだけです。
+
 ## クイックスタート (WSL)
 
 ```bash

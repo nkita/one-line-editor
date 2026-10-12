@@ -3,3 +3,5 @@
 // アプリのアイコン (ID 1)。Explorer・タスクバー・ジャンプリストは exe の最初のアイコンを使う。
 // lvt.ico は lvt-icon.png (元画像) から作った 16〜256px の 9 サイズ入り
 1 ICON "lvt.ico"
+// バージョン情報 (build.rs が Cargo.toml の version から OUT_DIR に生成する)
+#include "version.rc"
